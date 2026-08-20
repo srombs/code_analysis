@@ -1,10 +1,17 @@
 """Command-line entry point for code-analysis."""
 
 import argparse
+import json
+from pathlib import Path
 
 from openai import OpenAI
 
 MODEL = "gpt-5.6-luna"
+
+
+def read_text_file(file_path: str) -> str:
+    """Read a UTF-8 text file for use as model input."""
+    return Path(file_path).read_text(encoding="utf-8")
 
 
 def temperature(value: str) -> float:
@@ -29,9 +36,9 @@ def analyze_text(
     temperature: float,
     max_output_tokens: int,
     client: OpenAI,
-) -> str:
-    """Send text to the configured OpenAI model and return its output."""
-    response = client.responses.create(
+) -> object:
+    """Send text to the configured OpenAI model and return the API response."""
+    return client.responses.create(
         model=MODEL,
         instructions=instructions,
         input=text,
@@ -39,13 +46,17 @@ def analyze_text(
         max_output_tokens=max_output_tokens,
         reasoning={"effort": "none"},
     )
-    return response.output_text
+
+
+def format_response(response: object) -> str:
+    """Serialize an SDK response as formatted JSON for terminal output."""
+    return json.dumps(response.model_dump(), indent=2)
 
 
 def main() -> None:
-    """Analyze text supplied from the command line."""
+    """Analyze a text file supplied from the command line."""
     parser = argparse.ArgumentParser(description="Analyze a piece of text.")
-    parser.add_argument("text", help="Text to analyze")
+    parser.add_argument("file_path", help="Path to the UTF-8 text file to analyze")
     parser.add_argument("instructions", help="Instructions for the analysis")
     parser.add_argument(
         "temperature",
@@ -59,15 +70,19 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    print(
-        analyze_text(
-            args.text,
-            args.instructions,
-            args.temperature,
-            args.max_output_tokens,
-            OpenAI(),
-        )
+    try:
+        text = read_text_file(args.file_path)
+    except OSError as error:
+        parser.error(f"could not read {args.file_path}: {error.strerror or error}")
+
+    response = analyze_text(
+        text,
+        args.instructions,
+        args.temperature,
+        args.max_output_tokens,
+        OpenAI(),
     )
+    print(format_response(response))
 
 
 if __name__ == "__main__":
