@@ -28,4 +28,6 @@ The first argument is read into a `text` variable and sent to the model. The rem
 are the model instruction, a temperature between `0` and `2`, and maximum output tokens between
 `1` and `128000`. A lower temperature produces more focused output; a higher value yields more
 varied output. The command sends them to `gpt-5.6-luna` through the Responses API and prints the
-complete API response as formatted JSON.
+structured model output items as formatted JSON, followed by the input and output token counts.
+
+If the file path cannot be read, the command prompts for another path.
