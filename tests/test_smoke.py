@@ -178,6 +178,95 @@ def test_analyze_text_wraps_request_errors() -> None:
 
 def test_analyze_text_rejects_missing_parsed_output() -> None:
     response = type("Response", (), {"output_parsed": None})()
+    calls = []
+
+    class FakeResponses:
+        def parse(self, **kwargs):
+            calls.append(kwargs)
+            return response
+
+    client = type("Client", (), {"responses": FakeResponses()})()
+
+    with pytest.raises(main.AnalysisError, match="invalid analysis after 3 attempts"):
+        main.analyze_text("hello world", "Be concise.", client)
+
+    assert len(calls) == 3
+
+
+def test_analyze_text_retries_missing_parsed_output_before_succeeding(capsys) -> None:
+    empty_response = type("Response", (), {"output_parsed": None})()
+    parsed_result = main.AnalysisResult(summary="No issues found.", findings=[])
+    valid_response = type("Response", (), {"output_parsed": parsed_result})()
+    responses = [empty_response, valid_response]
+
+    class FakeResponses:
+        def parse(self, **kwargs):
+            return responses.pop(0)
+
+    client = type("Client", (), {"responses": FakeResponses()})()
+
+    assert main.analyze_text("hello world", "Be concise.", client) is valid_response
+    assert capsys.readouterr().out == "Invalid analysis response. Retrying (1/2)...\n"
+
+
+def test_analyze_text_retries_a_validation_error_before_succeeding(capsys) -> None:
+    parsed_result = main.AnalysisResult(summary="No issues found.", findings=[])
+    valid_response = type("Response", (), {"output_parsed": parsed_result})()
+    calls = []
+
+    class FakeResponses:
+        def parse(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                main.AnalysisResult.model_validate({})
+            return valid_response
+
+    client = type("Client", (), {"responses": FakeResponses()})()
+
+    assert main.analyze_text("hello world", "Be concise.", client) is valid_response
+    assert len(calls) == 2
+    assert capsys.readouterr().out == "Invalid analysis response. Retrying (1/2)...\n"
+
+
+def test_analyze_text_can_simulate_a_validation_error_once(capsys) -> None:
+    parsed_result = main.AnalysisResult(summary="No issues found.", findings=[])
+    valid_response = type("Response", (), {"output_parsed": parsed_result})()
+    calls = []
+
+    class FakeResponses:
+        def parse(self, **kwargs):
+            calls.append(kwargs)
+            return valid_response
+
+    client = type("Client", (), {"responses": FakeResponses()})()
+
+    assert (
+        main.analyze_text(
+            "hello world",
+            "Be concise.",
+            client,
+            simulate_validation_error_once=True,
+        )
+        is valid_response
+    )
+    assert len(calls) == 1
+    assert capsys.readouterr().out == "Invalid analysis response. Retrying (1/2)...\n"
+
+
+def test_analyze_text_rejects_findings_outside_the_numbered_input() -> None:
+    parsed_result = main.AnalysisResult(
+        summary="One issue found.",
+        findings=[
+            main.Finding(
+                start_line=3,
+                end_line=3,
+                problem="The input is not validated.",
+                solution="Validate the input before using it.",
+                severity="medium",
+            )
+        ],
+    )
+    response = type("Response", (), {"output_parsed": parsed_result})()
 
     class FakeResponses:
         def parse(self, **kwargs):
@@ -185,8 +274,8 @@ def test_analyze_text_rejects_missing_parsed_output() -> None:
 
     client = type("Client", (), {"responses": FakeResponses()})()
 
-    with pytest.raises(main.AnalysisError, match="did not contain a parsed analysis result"):
-        main.analyze_text("hello world", "Be concise.", client)
+    with pytest.raises(main.AnalysisError, match="input contains only 2 lines"):
+        main.analyze_text("first line\nsecond line", "Be concise.", client)
 
 
 def test_format_response_returns_pretty_json() -> None:
@@ -278,7 +367,11 @@ def test_main_prints_model_response(monkeypatch, capsys) -> None:
     monkeypatch.setattr(main, "OpenAI", lambda: object())
     monkeypatch.setattr(main, "read_text_file_with_retry", lambda file_path: "hello world")
     response = type("Response", (), {"output_parsed": object()})()
-    monkeypatch.setattr(main, "analyze_text", lambda text, instructions, client: response)
+    monkeypatch.setattr(
+        main,
+        "analyze_text",
+        lambda text, instructions, client, simulate_validation_error_once: response,
+    )
     monkeypatch.setattr(main, "format_response", lambda response: "Full API response")
     monkeypatch.setattr(
         main,
@@ -299,7 +392,7 @@ def test_main_reports_analysis_errors(monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         main,
         "analyze_text",
-        lambda *args: (_ for _ in ()).throw(
+        lambda *args, **kwargs: (_ for _ in ()).throw(
             main.AnalysisError("OpenAI request failed: invalid API key")
         ),
     )

@@ -6,9 +6,10 @@ from pathlib import Path
 from typing import Literal
 
 from openai import OpenAI
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 MODEL = "gpt-5.6-luna"
+MAX_VALIDATION_RETRIES = 2
 
 
 class AnalysisError(Exception):
@@ -89,26 +90,59 @@ def number_source_lines(text: str) -> str:
     )
 
 
+def validate_analysis_result_source_lines(
+    result: AnalysisResult,
+    numbered_source: str,
+) -> None:
+    """Ensure each finding references lines included in the model input."""
+    source_line_count = len(numbered_source.splitlines())
+
+    for finding_number, finding in enumerate(result.findings, start=1):
+        if finding.end_line > source_line_count:
+            raise AnalysisError(
+                f"Finding {finding_number} references lines {finding.start_line}-"
+                f"{finding.end_line}, but the input contains only {source_line_count} lines"
+            )
+
+
 def analyze_text(
     text: str,
     instructions: str,
     client: OpenAI,
+    simulate_validation_error_once: bool = False,
 ) -> object:
     """Send text for analysis and return a response containing an AnalysisResult."""
     numbered_source = number_source_lines(text)
 
-    try:
-        response = client.responses.parse(
-            model=MODEL,
-            instructions=instructions,
-            input=numbered_source,
-            text_format=AnalysisResult,
-        )
-    except Exception as error:
-        raise AnalysisError(f"OpenAI request failed: {error}") from error
+    for attempt in range(MAX_VALIDATION_RETRIES + 1):
+        try:
+            if simulate_validation_error_once and attempt == 0:
+                AnalysisResult.model_validate({})
 
-    if response.output_parsed is None:
-        raise AnalysisError("OpenAI response did not contain a parsed analysis result")
+            response = client.responses.parse(
+                model=MODEL,
+                instructions=instructions,
+                input=numbered_source,
+                text_format=AnalysisResult,
+            )
+        except ValidationError as error:
+            validation_error = error
+        except Exception as error:
+            raise AnalysisError(f"OpenAI request failed: {error}") from error
+        else:
+            if response.output_parsed is not None:
+                break
+            validation_error = ValueError("response did not contain a parsed analysis result")
+
+        if attempt == MAX_VALIDATION_RETRIES:
+            raise AnalysisError(
+                "OpenAI returned an invalid analysis after "
+                f"{attempt + 1} attempts: {validation_error}"
+            ) from validation_error
+
+        print(f"Invalid analysis response. Retrying ({attempt + 1}/{MAX_VALIDATION_RETRIES})...")
+
+    validate_analysis_result_source_lines(response.output_parsed, numbered_source)
 
     return response
 
@@ -168,6 +202,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Analyze a piece of text.")
     parser.add_argument("file_path", help="Path to the UTF-8 text file to analyze")
     parser.add_argument("instructions", help="Instructions for the analysis")
+    parser.add_argument(
+        "--simulate-validation-error-once",
+        action="store_true",
+        help="Testing only: force one validation error before calling the API",
+    )
     args = parser.parse_args()
 
     text = read_text_file_with_retry(args.file_path)
@@ -178,7 +217,12 @@ def main() -> None:
         parser.error(f"could not initialize OpenAI client: {error}")
 
     try:
-        response = analyze_text(text, args.instructions, client)
+        response = analyze_text(
+            text,
+            args.instructions,
+            client,
+            simulate_validation_error_once=args.simulate_validation_error_once,
+        )
     except AnalysisError as error:
         parser.error(str(error))
 
