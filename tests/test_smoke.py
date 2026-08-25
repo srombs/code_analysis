@@ -344,6 +344,30 @@ def test_format_token_usage_handles_missing_usage() -> None:
     assert main.format_token_usage(response) == "Token usage: unavailable"
 
 
+def test_format_analysis_metrics_returns_usage_cost_and_elapsed_time() -> None:
+    usage = type("Usage", (), {"input_tokens": 100, "output_tokens": 50})()
+    response = type("Response", (), {"usage": usage})()
+
+    assert main.format_analysis_metrics(response, 1.234) == (
+        "Analysis Metrics\n"
+        "  Input tokens: 100\n"
+        "  Output tokens: 50\n"
+        "  Estimated token cost: $0.000080\n"
+        "  Analysis time: 1.23 seconds"
+    )
+
+
+def test_format_analysis_metrics_handles_missing_usage() -> None:
+    response = type("Response", (), {"usage": None})()
+
+    assert main.format_analysis_metrics(response, 1.234) == (
+        "Analysis Metrics\n"
+        "  Token usage: unavailable\n"
+        "  Estimated token cost: unavailable\n"
+        "  Analysis time: 1.23 seconds"
+    )
+
+
 def test_temperature_accepts_values_from_zero_to_two() -> None:
     assert main.temperature("0.7") == 0.7
 
@@ -378,11 +402,14 @@ def test_main_prints_model_response(monkeypatch, capsys) -> None:
         "format_analysis_result_object",
         lambda result: "Formatted analysis result",
     )
+    monkeypatch.setattr(main, "format_analysis_metrics", lambda response, elapsed: "Metrics")
+    timestamps = iter([10.0, 11.5])
+    monkeypatch.setattr(main.time, "perf_counter", lambda: next(timestamps))
     monkeypatch.setattr(main, "format_token_usage", lambda response: "Token usage: 10")
 
     main.main()
 
-    assert capsys.readouterr().out == "Formatted analysis result\n"
+    assert capsys.readouterr().out == "Formatted analysis result\nMetrics\n"
 
 
 def test_main_reports_analysis_errors(monkeypatch, capsys) -> None:

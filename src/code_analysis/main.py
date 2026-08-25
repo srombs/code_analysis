@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import time
 from pathlib import Path
 from typing import Literal
 
@@ -10,6 +11,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 MODEL = "gpt-5.6-luna"
 MAX_VALIDATION_RETRIES = 2
+INPUT_TOKEN_COST_PER_MILLION = 0.20
+OUTPUT_TOKEN_COST_PER_MILLION = 1.20
 
 
 class AnalysisError(Exception):
@@ -197,6 +200,30 @@ def format_token_usage(response: object) -> str:
     )
 
 
+def format_analysis_metrics(response: object, elapsed_seconds: float) -> str:
+    """Format token usage, estimated token cost, and analysis duration."""
+    lines = ["Analysis Metrics"]
+
+    if response.usage is None:
+        lines.append("  Token usage: unavailable")
+        lines.append("  Estimated token cost: unavailable")
+    else:
+        input_cost = response.usage.input_tokens * INPUT_TOKEN_COST_PER_MILLION / 1_000_000
+        output_cost = response.usage.output_tokens * OUTPUT_TOKEN_COST_PER_MILLION / 1_000_000
+        estimated_cost = input_cost + output_cost
+
+        lines.extend(
+            [
+                f"  Input tokens: {response.usage.input_tokens}",
+                f"  Output tokens: {response.usage.output_tokens}",
+                f"  Estimated token cost: ${estimated_cost:.6f}",
+            ]
+        )
+
+    lines.append(f"  Analysis time: {elapsed_seconds:.2f} seconds")
+    return "\n".join(lines)
+
+
 def main() -> None:
     """Analyze a text file supplied from the command line."""
     parser = argparse.ArgumentParser(description="Analyze a piece of text.")
@@ -216,6 +243,8 @@ def main() -> None:
     except Exception as error:
         parser.error(f"could not initialize OpenAI client: {error}")
 
+    analysis_started_at = time.perf_counter()
+
     try:
         response = analyze_text(
             text,
@@ -226,7 +255,10 @@ def main() -> None:
     except AnalysisError as error:
         parser.error(str(error))
 
+    analysis_elapsed_seconds = time.perf_counter() - analysis_started_at
+
     print(format_analysis_result_object(response.output_parsed))
+    print(format_analysis_metrics(response, analysis_elapsed_seconds))
     # print(format_token_usage(response))
 
 
