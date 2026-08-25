@@ -41,6 +41,79 @@ def test_finding_rejects_unknown_severity_and_backward_ranges() -> None:
         )
 
 
+def test_analysis_result_rejects_a_response_with_missing_finding_fields() -> None:
+    incomplete_response = {
+        "summary": "One issue found.",
+        "findings": [
+            {
+                "start_line": 2,
+                "end_line": 2,
+                "problem": "The input is not validated.",
+                "severity": "medium",
+            }
+        ],
+    }
+
+    with pytest.raises(ValidationError) as error:
+        main.AnalysisResult.model_validate(incomplete_response)
+
+    assert "solution" in str(error.value)
+
+
+def test_analysis_result_rejects_a_response_with_wrong_field_types() -> None:
+    wrong_type_response = {
+        "summary": "One issue found.",
+        "findings": [
+            {
+                "start_line": "second",
+                "end_line": 2,
+                "problem": "The input is not validated.",
+                "solution": "Validate the input before using it.",
+                "severity": "medium",
+            }
+        ],
+    }
+
+    with pytest.raises(ValidationError) as error:
+        main.AnalysisResult.model_validate(wrong_type_response)
+
+    assert "start_line" in str(error.value)
+
+
+def test_analysis_result_rejects_a_response_with_an_unexpected_severity() -> None:
+    unexpected_enum_response = {
+        "summary": "One issue found.",
+        "findings": [
+            {
+                "start_line": 2,
+                "end_line": 2,
+                "problem": "The input is not validated.",
+                "solution": "Validate the input before using it.",
+                "severity": "critical",
+            }
+        ],
+    }
+
+    with pytest.raises(ValidationError) as error:
+        main.AnalysisResult.model_validate(unexpected_enum_response)
+
+    assert "severity" in str(error.value)
+
+
+def test_analysis_result_rejects_an_empty_response_object() -> None:
+    with pytest.raises(ValidationError) as error:
+        main.AnalysisResult.model_validate({})
+
+    error_message = str(error.value)
+    assert "summary" in error_message
+    assert "findings" in error_message
+
+
+def test_analysis_result_rejects_an_empty_response_string() -> None:
+    with pytest.raises(ValidationError):
+        main.AnalysisResult.model_validate("")
+
+
 def test_read_text_file_returns_file_contents(tmp_path) -> None:
     source_file = tmp_path / "example.py"
     source_file.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
@@ -139,6 +212,33 @@ def test_format_analysis_result_returns_pretty_json() -> None:
     )
 
 
+def test_format_analysis_result_object_returns_readable_report() -> None:
+    result = main.AnalysisResult(
+        summary="One issue found.",
+        findings=[
+            main.Finding(
+                start_line=2,
+                end_line=3,
+                problem="The input is not validated.",
+                solution="Validate the input before using it.",
+                severity="medium",
+                start_character=10,
+                end_character=20,
+            )
+        ],
+    )
+
+    assert main.format_analysis_result_object(result) == (
+        "Analysis Result\n"
+        "Summary: One issue found.\n"
+        "\n"
+        "Findings:\n"
+        "  1. [MEDIUM] lines 2-3, characters 10-20\n"
+        "     Problem: The input is not validated.\n"
+        "     Solution: Validate the input before using it."
+    )
+
+
 def test_format_token_usage_returns_input_and_output_counts() -> None:
     usage = type("Usage", (), {"input_tokens": 123, "output_tokens": 45})()
     response = type("Response", (), {"usage": usage})()
@@ -177,17 +277,19 @@ def test_main_prints_model_response(monkeypatch, capsys) -> None:
     )
     monkeypatch.setattr(main, "OpenAI", lambda: object())
     monkeypatch.setattr(main, "read_text_file_with_retry", lambda file_path: "hello world")
-    response = type("Response", (), {"output_parsed": "AnalysisResult(...)"})()
+    response = type("Response", (), {"output_parsed": object()})()
     monkeypatch.setattr(main, "analyze_text", lambda text, instructions, client: response)
     monkeypatch.setattr(main, "format_response", lambda response: "Full API response")
     monkeypatch.setattr(
-        main, "format_analysis_result", lambda response: "Structured analysis result"
+        main,
+        "format_analysis_result_object",
+        lambda result: "Formatted analysis result",
     )
     monkeypatch.setattr(main, "format_token_usage", lambda response: "Token usage: 10")
 
     main.main()
 
-    assert capsys.readouterr().out == "AnalysisResult(...)\nStructured analysis result\n"
+    assert capsys.readouterr().out == "Formatted analysis result\n"
 
 
 def test_main_reports_analysis_errors(monkeypatch, capsys) -> None:

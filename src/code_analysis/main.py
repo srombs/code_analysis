@@ -128,6 +128,29 @@ def format_analysis_result(response: object) -> str:
     return response.output_parsed.model_dump_json(indent=2)
 
 
+def format_analysis_result_object(result: AnalysisResult) -> str:
+    """Format an AnalysisResult object as a readable terminal report."""
+    lines = ["Analysis Result", f"Summary: {result.summary}", "", "Findings:"]
+
+    if not result.findings:
+        lines.append("  No issues found.")
+
+    for number, finding in enumerate(result.findings, start=1):
+        location = f"lines {finding.start_line}-{finding.end_line}"
+        if finding.start_character is not None and finding.end_character is not None:
+            location += f", characters {finding.start_character}-{finding.end_character}"
+
+        lines.extend(
+            [
+                f"  {number}. [{finding.severity.upper()}] {location}",
+                f"     Problem: {finding.problem}",
+                f"     Solution: {finding.solution}",
+            ]
+        )
+
+    return "\n".join(lines)
+
+
 def format_token_usage(response: object) -> str:
     """Format the response's input and output token counts."""
     if response.usage is None:
@@ -159,8 +182,7 @@ def main() -> None:
     except AnalysisError as error:
         parser.error(str(error))
 
-    print(response.output_parsed)
-    # print(format_analysis_result(response))
+    print(format_analysis_result_object(response.output_parsed))
     # print(format_token_usage(response))
 
 
