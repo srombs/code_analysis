@@ -5,10 +5,52 @@ import pytest
 from pydantic import ValidationError
 
 from code_analysis import main
+from code_analysis.schemas import AnalysisResult, Finding
+from code_analysis.tool_schemas import READ_SOURCE_LINE_TOOL, read_source_line
 
 
 def test_main_is_available() -> None:
     assert callable(main.main)
+
+
+def test_read_source_line_tool_schema_requires_a_positive_line_number() -> None:
+    tool = READ_SOURCE_LINE_TOOL
+
+    assert tool["type"] == "function"
+    assert tool["name"] == "read_source_line"
+    assert tool["strict"] is True
+    assert tool["parameters"] == {
+        "type": "object",
+        "properties": {
+            "line_number": {
+                "type": "integer",
+                "description": "The one-based source line number to read.",
+                "minimum": 1,
+            }
+        },
+        "required": ["line_number"],
+        "additionalProperties": False,
+    }
+
+
+def test_read_source_line_returns_the_requested_one_based_line() -> None:
+    assert read_source_line("first\nsecond\nthird", 2) == "2: second"
+
+
+@pytest.mark.parametrize("line_number", [0, 4])
+def test_read_source_line_rejects_out_of_range_line_numbers(line_number: int) -> None:
+    with pytest.raises(ValueError, match="between 1 and 3"):
+        read_source_line("first\nsecond\nthird", line_number)
+
+
+def test_read_source_line_rejects_a_non_integer_line_number() -> None:
+    with pytest.raises(TypeError, match="must be an integer"):
+        read_source_line("first", True)
+
+
+def test_main_uses_the_schemas_module_models() -> None:
+    assert main.AnalysisResult is AnalysisResult
+    assert main.Finding is Finding
 
 
 def test_analysis_result_accepts_valid_findings() -> None:
