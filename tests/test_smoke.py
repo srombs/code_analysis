@@ -14,6 +14,7 @@ from code_analysis.tool_schemas import (
     READ_SOURCE_LINE_TOOL,
     SEARCH_CODE_MAX_RESULTS,
     SEARCH_CODE_TOOL,
+    FileState,
     SearchCodeResult,
     SearchResult,
     list_files,
@@ -89,6 +90,18 @@ def test_search_code_result_contains_matches_and_metadata() -> None:
     assert result.matches == (match,)
     assert result.total_matches == 4
     assert result.truncated is False
+
+
+def test_file_state_contains_file_metadata_and_numbered_content() -> None:
+    state = FileState(
+        file_path="widgets/button.dart",
+        line_count=2,
+        numbered_content="1: class Button {}\n2: ",
+    )
+
+    assert state.file_path == "widgets/button.dart"
+    assert state.line_count == 2
+    assert state.numbered_content == "1: class Button {}\n2: "
 
 
 def test_read_file_has_the_door_opener_lib_directory_as_its_default() -> None:
@@ -384,7 +397,10 @@ def test_analyze_text_executes_a_requested_file_read_and_returns_its_output(
         {
             "type": "function_call_output",
             "call_id": "call_123",
-            "output": "1: class Widget {}",
+            "output": (
+                '{"file_path": "widget.dart", "line_count": 1, '
+                '"numbered_content": "1: class Widget {}"}'
+            ),
         }
     ]
     assert calls[1]["previous_response_id"] == "response_1"

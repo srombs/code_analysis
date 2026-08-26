@@ -14,6 +14,7 @@ from code_analysis.tool_schemas import (
     LIST_FILES_TOOL,
     READ_FILE_TOOL,
     SEARCH_CODE_TOOL,
+    FileState,
     list_files,
     read_file,
     search_code,
@@ -22,7 +23,7 @@ from code_analysis.tool_schemas import (
 MODEL = "gpt-5.6-luna"
 AGENT_INSTRUCTIONS = "You are a code-analysis agent. Return a structured analysis result."
 MAX_VALIDATION_RETRIES = 2
-MAX_TOOL_CALL_ROUNDS = 5
+MAX_TOOL_CALL_ROUNDS = 15
 INPUT_TOKEN_COST_PER_MILLION = 0.20
 OUTPUT_TOKEN_COST_PER_MILLION = 1.20
 
@@ -103,8 +104,14 @@ def execute_file_tool_calls(response: object) -> list[dict[str, str]]:
 
                 file_path = arguments["file_path"]
                 print(f"Tool call: read_file({file_path})")
-                output = number_source_lines(read_file(file_path))
-                print(f"Tool result: read {file_path} ({len(output.splitlines())} lines)")
+                source_text = read_file(file_path)
+                file_state = FileState(
+                    file_path=file_path,
+                    line_count=len(source_text.splitlines()),
+                    numbered_content=number_source_lines(source_text),
+                )
+                output = json.dumps(asdict(file_state))
+                print(f"Tool result: read {file_path} ({file_state.line_count} lines)")
             elif output_item.name == LIST_FILES_TOOL["name"]:
                 if not isinstance(arguments, dict) or set(arguments) != {"directory_path"}:
                     raise ValueError("tool arguments must contain only directory_path")
@@ -177,7 +184,7 @@ def request_analysis_with_tools(
             tool_choice="auto",
         )
 
-    raise AnalysisError(f"Model requested more than {MAX_TOOL_CALL_ROUNDS} rounds of file reads.")
+    raise AnalysisError(f"Model requested more than {MAX_TOOL_CALL_ROUNDS} rounds of tooling.")
 
 
 def analyze_text(

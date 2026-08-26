@@ -26,6 +26,15 @@ class SearchCodeResult:
     truncated: bool
 
 
+@dataclass(frozen=True)
+class FileState:
+    """The metadata and numbered contents of one source file sent to the model."""
+
+    file_path: str
+    line_count: int
+    numbered_content: str
+
+
 READ_SOURCE_LINE_TOOL = {
     "type": "function",
     "name": "read_source_line",
@@ -49,7 +58,10 @@ READ_SOURCE_LINE_TOOL = {
 READ_FILE_TOOL = {
     "type": "function",
     "name": "read_file",
-    "description": "Read a UTF-8 Dart source file from the approved project directory.",
+    "description": (
+        "Read a UTF-8 Dart source file from the approved project directory. Return an "
+        "object with file_path, line_count, and numbered_content."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
