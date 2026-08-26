@@ -9,7 +9,7 @@ from openai import OpenAI
 from pydantic import ValidationError
 
 from code_analysis.schemas import AnalysisResult, Finding  # noqa: F401
-from code_analysis.tool_schemas import READ_SOURCE_FILE_TOOL, read_source_file
+from code_analysis.tool_schemas import LIST_FILES_TOOL, READ_FILE_TOOL, list_files, read_file
 
 MODEL = "gpt-5.6-luna"
 AGENT_INSTRUCTIONS = "You are a code-analysis agent. Return a structured analysis result."
@@ -80,7 +80,7 @@ def validate_analysis_result_source_lines(
 
 
 def execute_file_tool_calls(response: object) -> list[dict[str, str]]:
-    """Execute requested file reads and format their results for the API."""
+    """Execute requested file tools and format their results for the API."""
     tool_outputs = []
 
     for output_item in getattr(response, "output", []):
@@ -88,19 +88,28 @@ def execute_file_tool_calls(response: object) -> list[dict[str, str]]:
             continue
 
         try:
-            if output_item.name != READ_SOURCE_FILE_TOOL["name"]:
-                raise ValueError(f"unsupported tool: {output_item.name}")
-
             arguments = json.loads(output_item.arguments)
-            if not isinstance(arguments, dict) or set(arguments) != {"file_path"}:
-                raise ValueError("tool arguments must contain only file_path")
+            if output_item.name == READ_FILE_TOOL["name"]:
+                if not isinstance(arguments, dict) or set(arguments) != {"file_path"}:
+                    raise ValueError("tool arguments must contain only file_path")
 
-            file_path = arguments["file_path"]
-            print(f"Tool call: read_source_file({file_path})")
-            output = number_source_lines(read_source_file(file_path))
-            print(f"Tool result: read {file_path} ({len(output.splitlines())} lines)")
+                file_path = arguments["file_path"]
+                print(f"Tool call: read_file({file_path})")
+                output = number_source_lines(read_file(file_path))
+                print(f"Tool result: read {file_path} ({len(output.splitlines())} lines)")
+            elif output_item.name == LIST_FILES_TOOL["name"]:
+                if not isinstance(arguments, dict) or set(arguments) != {"directory_path"}:
+                    raise ValueError("tool arguments must contain only directory_path")
+
+                directory_path = arguments["directory_path"]
+                print(f"Tool call: list_files({directory_path})")
+                output = list_files(directory_path)
+                print(f"Tool result: listed {len(output.splitlines())} files")
+                print(f"Tool output:\n{output or '(no files found)'}")
+            else:
+                raise ValueError(f"unsupported tool: {output_item.name}")
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
-            output = f"Could not read source file: {error}"
+            output = f"Could not execute file tool: {error}"
             print(f"Tool error: {output}")
 
         tool_outputs.append(
@@ -124,7 +133,7 @@ def request_analysis_with_tools(
         "model": MODEL,
         "instructions": AGENT_INSTRUCTIONS,
         "text_format": AnalysisResult,
-        "tools": [READ_SOURCE_FILE_TOOL],
+        "tools": [READ_FILE_TOOL, LIST_FILES_TOOL],
         "tool_choice": "auto",
     }
     request_options["input"] = number_source_lines(text) if text else instructions
@@ -142,7 +151,7 @@ def request_analysis_with_tools(
             input=tool_outputs,
             previous_response_id=response.id,
             text_format=AnalysisResult,
-            tools=[READ_SOURCE_FILE_TOOL],
+            tools=[READ_FILE_TOOL, LIST_FILES_TOOL],
             tool_choice="auto",
         )
 

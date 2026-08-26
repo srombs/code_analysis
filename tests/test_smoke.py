@@ -9,9 +9,11 @@ from code_analysis import main
 from code_analysis.schemas import AnalysisResult, Finding
 from code_analysis.tool_schemas import (
     DEFAULT_APPROVED_DIRECTORY,
-    READ_SOURCE_FILE_TOOL,
+    LIST_FILES_TOOL,
+    READ_FILE_TOOL,
     READ_SOURCE_LINE_TOOL,
-    read_source_file,
+    list_files,
+    read_file,
     read_source_line,
 )
 
@@ -40,14 +42,22 @@ def test_read_source_line_tool_schema_requires_a_positive_line_number() -> None:
     }
 
 
-def test_read_source_file_tool_schema_requires_a_file_path() -> None:
-    assert READ_SOURCE_FILE_TOOL["name"] == "read_source_file"
-    assert READ_SOURCE_FILE_TOOL["strict"] is True
-    assert READ_SOURCE_FILE_TOOL["parameters"]["required"] == ["file_path"]
-    assert READ_SOURCE_FILE_TOOL["parameters"]["properties"]["file_path"]["type"] == "string"
+def test_read_file_tool_schema_requires_a_file_path() -> None:
+    assert READ_FILE_TOOL["name"] == "read_file"
+    assert READ_FILE_TOOL["strict"] is True
+    assert READ_FILE_TOOL["parameters"]["required"] == ["file_path"]
+    assert READ_FILE_TOOL["parameters"]["properties"]["file_path"]["type"] == "string"
 
 
-def test_read_source_file_has_the_door_opener_lib_directory_as_its_default() -> None:
+def test_list_files_tool_schema_requires_a_directory_path() -> None:
+    assert LIST_FILES_TOOL["type"] == "function"
+    assert LIST_FILES_TOOL["name"] == "list_files"
+    assert LIST_FILES_TOOL["strict"] is True
+    assert LIST_FILES_TOOL["parameters"]["required"] == ["directory_path"]
+    assert LIST_FILES_TOOL["parameters"]["properties"]["directory_path"]["type"] == "string"
+
+
+def test_read_file_has_the_door_opener_lib_directory_as_its_default() -> None:
     assert DEFAULT_APPROVED_DIRECTORY == Path("/Users/rombs/Documents/gits/door-opener/lib")
 
 
@@ -66,16 +76,39 @@ def test_read_source_line_rejects_a_non_integer_line_number() -> None:
         read_source_line("first", True)
 
 
-def test_read_source_file_returns_text_from_the_approved_directory(tmp_path) -> None:
-    source_file = tmp_path / "example.py"
+def test_read_file_returns_text_from_the_approved_directory(tmp_path) -> None:
+    source_file = tmp_path / "example.dart"
     source_file.write_text("print('hello')\n", encoding="utf-8")
 
-    assert read_source_file("example.py", tmp_path) == "print('hello')\n"
+    assert read_file("example.dart", tmp_path) == "print('hello')\n"
 
 
-def test_read_source_file_rejects_paths_outside_the_approved_directory(tmp_path) -> None:
+def test_read_file_rejects_paths_outside_the_approved_directory(tmp_path) -> None:
     with pytest.raises(ValueError, match="approved directory"):
-        read_source_file("../outside.txt", tmp_path)
+        read_file("../outside.txt", tmp_path)
+
+
+def test_read_file_rejects_non_dart_files(tmp_path) -> None:
+    (tmp_path / "settings.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"must have the \.dart extension"):
+        read_file("settings.json", tmp_path)
+
+
+def test_list_files_returns_sorted_paths_relative_to_the_approved_directory(tmp_path) -> None:
+    (tmp_path / "zebra.py").write_text("", encoding="utf-8")
+    subdirectory = tmp_path / "widgets"
+    subdirectory.mkdir()
+    (subdirectory / "button.py").write_text("", encoding="utf-8")
+    (subdirectory / "input.py").write_text("", encoding="utf-8")
+
+    assert list_files("widgets", tmp_path) == "widgets/button.py\nwidgets/input.py"
+    assert list_files("", tmp_path) == "widgets/\nzebra.py"
+
+
+def test_list_files_rejects_paths_outside_the_approved_directory(tmp_path) -> None:
+    with pytest.raises(ValueError, match="approved directory"):
+        list_files("../", tmp_path)
 
 
 def test_main_uses_the_schemas_module_models() -> None:
@@ -229,7 +262,7 @@ def test_analyze_text_uses_luna_model() -> None:
             "instructions": main.AGENT_INSTRUCTIONS,
             "input": "1: first line\n2: second line",
             "text_format": main.AnalysisResult,
-            "tools": [main.READ_SOURCE_FILE_TOOL],
+            "tools": [main.READ_FILE_TOOL, main.LIST_FILES_TOOL],
             "tool_choice": "auto",
         }
     ]
@@ -244,7 +277,7 @@ def test_analyze_text_executes_a_requested_file_read_and_returns_its_output(
         (),
         {
             "type": "function_call",
-            "name": "read_source_file",
+            "name": "read_file",
             "arguments": '{"file_path": "widget.dart"}',
             "call_id": "call_123",
         },
@@ -267,7 +300,7 @@ def test_analyze_text_executes_a_requested_file_read_and_returns_its_output(
             calls.append(kwargs)
             return [first_response, final_response][len(calls) - 1]
 
-    monkeypatch.setattr(main, "read_source_file", lambda file_path: "class Widget {}\n")
+    monkeypatch.setattr(main, "read_file", lambda file_path: "class Widget {}\n")
     client = type("Client", (), {"responses": FakeResponses()})()
 
     assert main.analyze_text("entry point", "Analyze related code.", client) is final_response
@@ -280,7 +313,58 @@ def test_analyze_text_executes_a_requested_file_read_and_returns_its_output(
     ]
     assert calls[1]["previous_response_id"] == "response_1"
     assert capsys.readouterr().out == (
-        "Tool call: read_source_file(widget.dart)\nTool result: read widget.dart (1 lines)\n"
+        "Tool call: read_file(widget.dart)\nTool result: read widget.dart (1 lines)\n"
+    )
+
+
+def test_analyze_text_executes_a_requested_file_list_and_returns_its_output(
+    monkeypatch,
+    capsys,
+) -> None:
+    tool_call = type(
+        "ToolCall",
+        (),
+        {
+            "type": "function_call",
+            "name": "list_files",
+            "arguments": '{"directory_path": "widgets"}',
+            "call_id": "call_456",
+        },
+    )()
+    first_response = type(
+        "Response",
+        (),
+        {"id": "response_1", "output_parsed": None, "output": [tool_call]},
+    )()
+    parsed_result = main.AnalysisResult(summary="No issues found.", findings=[])
+    final_response = type(
+        "Response",
+        (),
+        {"output_parsed": parsed_result, "output": []},
+    )()
+    calls = []
+
+    class FakeResponses:
+        def parse(self, **kwargs):
+            calls.append(kwargs)
+            return [first_response, final_response][len(calls) - 1]
+
+    monkeypatch.setattr(main, "list_files", lambda directory_path: "widgets/button.py")
+    client = type("Client", (), {"responses": FakeResponses()})()
+
+    assert main.analyze_text("entry point", "Analyze related code.", client) is final_response
+    assert calls[1]["input"] == [
+        {
+            "type": "function_call_output",
+            "call_id": "call_456",
+            "output": "widgets/button.py",
+        }
+    ]
+    assert capsys.readouterr().out == (
+        "Tool call: list_files(widgets)\n"
+        "Tool result: listed 1 files\n"
+        "Tool output:\n"
+        "widgets/button.py\n"
     )
 
 
@@ -290,7 +374,7 @@ def test_file_tool_errors_are_returned_to_the_model(monkeypatch) -> None:
         (),
         {
             "type": "function_call",
-            "name": "read_source_file",
+            "name": "read_file",
             "arguments": '{"file_path": "../.env"}',
             "call_id": "call_123",
         },
@@ -298,7 +382,7 @@ def test_file_tool_errors_are_returned_to_the_model(monkeypatch) -> None:
     response = type("Response", (), {"output": [tool_call]})()
     monkeypatch.setattr(
         main,
-        "read_source_file",
+        "read_file",
         lambda file_path: (_ for _ in ()).throw(ValueError("path is not allowed")),
     )
 
@@ -306,7 +390,7 @@ def test_file_tool_errors_are_returned_to_the_model(monkeypatch) -> None:
         {
             "type": "function_call_output",
             "call_id": "call_123",
-            "output": "Could not read source file: path is not allowed",
+            "output": "Could not execute file tool: path is not allowed",
         }
     ]
 
