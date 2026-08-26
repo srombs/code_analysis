@@ -3,13 +3,21 @@
 import argparse
 import json
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 from openai import OpenAI
 from pydantic import ValidationError
 
 from code_analysis.schemas import AnalysisResult, Finding  # noqa: F401
-from code_analysis.tool_schemas import LIST_FILES_TOOL, READ_FILE_TOOL, list_files, read_file
+from code_analysis.tool_schemas import (
+    LIST_FILES_TOOL,
+    READ_FILE_TOOL,
+    SEARCH_CODE_TOOL,
+    list_files,
+    read_file,
+    search_code,
+)
 
 MODEL = "gpt-5.6-luna"
 AGENT_INSTRUCTIONS = "You are a code-analysis agent. Return a structured analysis result."
@@ -106,6 +114,20 @@ def execute_file_tool_calls(response: object) -> list[dict[str, str]]:
                 output = list_files(directory_path)
                 print(f"Tool result: listed {len(output.splitlines())} files")
                 print(f"Tool output:\n{output or '(no files found)'}")
+            elif output_item.name == SEARCH_CODE_TOOL["name"]:
+                if not isinstance(arguments, dict) or set(arguments) != {"query"}:
+                    raise ValueError("tool arguments must contain only query")
+
+                query = arguments["query"]
+                print(f"Tool call: search_code({query})")
+                search_result = search_code(query)
+                output = json.dumps(asdict(search_result))
+                print(
+                    "Tool result: found "
+                    f"{search_result.total_matches} matches "
+                    f"(returned {len(search_result.matches)})"
+                )
+                print(f"Tool output:\n{json.dumps(asdict(search_result), indent=2)}")
             else:
                 raise ValueError(f"unsupported tool: {output_item.name}")
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
@@ -133,7 +155,7 @@ def request_analysis_with_tools(
         "model": MODEL,
         "instructions": AGENT_INSTRUCTIONS,
         "text_format": AnalysisResult,
-        "tools": [READ_FILE_TOOL, LIST_FILES_TOOL],
+        "tools": [READ_FILE_TOOL, LIST_FILES_TOOL, SEARCH_CODE_TOOL],
         "tool_choice": "auto",
     }
     request_options["input"] = number_source_lines(text) if text else instructions
@@ -151,7 +173,7 @@ def request_analysis_with_tools(
             input=tool_outputs,
             previous_response_id=response.id,
             text_format=AnalysisResult,
-            tools=[READ_FILE_TOOL, LIST_FILES_TOOL],
+            tools=[READ_FILE_TOOL, LIST_FILES_TOOL, SEARCH_CODE_TOOL],
             tool_choice="auto",
         )
 

@@ -12,9 +12,14 @@ from code_analysis.tool_schemas import (
     LIST_FILES_TOOL,
     READ_FILE_TOOL,
     READ_SOURCE_LINE_TOOL,
+    SEARCH_CODE_MAX_RESULTS,
+    SEARCH_CODE_TOOL,
+    SearchCodeResult,
+    SearchResult,
     list_files,
     read_file,
     read_source_line,
+    search_code,
 )
 
 
@@ -57,6 +62,35 @@ def test_list_files_tool_schema_requires_a_directory_path() -> None:
     assert LIST_FILES_TOOL["parameters"]["properties"]["directory_path"]["type"] == "string"
 
 
+def test_search_code_tool_schema_requires_a_query() -> None:
+    assert SEARCH_CODE_TOOL["type"] == "function"
+    assert SEARCH_CODE_TOOL["name"] == "search_code"
+    assert SEARCH_CODE_TOOL["strict"] is True
+    assert SEARCH_CODE_TOOL["parameters"]["required"] == ["query"]
+    assert SEARCH_CODE_TOOL["parameters"]["properties"]["query"]["type"] == "string"
+
+
+def test_search_result_represents_a_code_match() -> None:
+    result = SearchResult(
+        path="widgets/button.dart",
+        line_number=42,
+        text="class Button extends StatelessWidget {",
+    )
+
+    assert result.path == "widgets/button.dart"
+    assert result.line_number == 42
+    assert result.text == "class Button extends StatelessWidget {"
+
+
+def test_search_code_result_contains_matches_and_metadata() -> None:
+    match = SearchResult(path="button.dart", line_number=1, text="class Button {}")
+    result = SearchCodeResult(matches=(match,), total_matches=4, truncated=False)
+
+    assert result.matches == (match,)
+    assert result.total_matches == 4
+    assert result.truncated is False
+
+
 def test_read_file_has_the_door_opener_lib_directory_as_its_default() -> None:
     assert DEFAULT_APPROVED_DIRECTORY == Path("/Users/rombs/Documents/gits/door-opener/lib")
 
@@ -93,6 +127,48 @@ def test_read_file_rejects_non_dart_files(tmp_path) -> None:
 
     with pytest.raises(ValueError, match=r"must have the \.dart extension"):
         read_file("settings.json", tmp_path)
+
+
+def test_search_code_returns_a_result_for_each_matching_line(tmp_path) -> None:
+    (tmp_path / "example.dart").write_text(
+        "first line\nfind this\n",
+        encoding="utf-8",
+    )
+    widgets_directory = tmp_path / "widgets"
+    widgets_directory.mkdir()
+    (widgets_directory / "button.dart").write_text("find this too\n", encoding="utf-8")
+    (tmp_path / "ignored.txt").write_text("find this\n", encoding="utf-8")
+
+    assert search_code("find this", tmp_path) == SearchCodeResult(
+        matches=(
+            SearchResult(path="example.dart", line_number=2, text="find this"),
+            SearchResult(path="widgets/button.dart", line_number=1, text="find this too"),
+        ),
+        total_matches=2,
+        truncated=False,
+    )
+
+
+def test_search_code_rejects_an_empty_query(tmp_path) -> None:
+    (tmp_path / "example.dart").write_text("anything", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must not be empty"):
+        search_code("", tmp_path)
+
+
+def test_search_code_stops_after_thirty_matches(tmp_path) -> None:
+    (tmp_path / "many_matches.dart").write_text(
+        "\n".join("match" for _ in range(31)),
+        encoding="utf-8",
+    )
+
+    result = search_code("match", tmp_path)
+
+    assert len(result.matches) == SEARCH_CODE_MAX_RESULTS
+    assert result.matches[0].line_number == 1
+    assert result.matches[-1].line_number == SEARCH_CODE_MAX_RESULTS
+    assert result.total_matches == 31
+    assert result.truncated is True
 
 
 def test_list_files_returns_sorted_paths_relative_to_the_approved_directory(tmp_path) -> None:
@@ -262,7 +338,7 @@ def test_analyze_text_uses_luna_model() -> None:
             "instructions": main.AGENT_INSTRUCTIONS,
             "input": "1: first line\n2: second line",
             "text_format": main.AnalysisResult,
-            "tools": [main.READ_FILE_TOOL, main.LIST_FILES_TOOL],
+            "tools": [main.READ_FILE_TOOL, main.LIST_FILES_TOOL, main.SEARCH_CODE_TOOL],
             "tool_choice": "auto",
         }
     ]
@@ -366,6 +442,66 @@ def test_analyze_text_executes_a_requested_file_list_and_returns_its_output(
         "Tool output:\n"
         "widgets/button.py\n"
     )
+
+
+def test_analyze_text_executes_a_requested_code_search_and_returns_its_output(
+    monkeypatch,
+    capsys,
+) -> None:
+    tool_call = type(
+        "ToolCall",
+        (),
+        {
+            "type": "function_call",
+            "name": "search_code",
+            "arguments": '{"query": "Button"}',
+            "call_id": "call_789",
+        },
+    )()
+    first_response = type(
+        "Response",
+        (),
+        {"id": "response_1", "output_parsed": None, "output": [tool_call]},
+    )()
+    parsed_result = main.AnalysisResult(summary="No issues found.", findings=[])
+    final_response = type(
+        "Response",
+        (),
+        {"output_parsed": parsed_result, "output": []},
+    )()
+    calls = []
+
+    class FakeResponses:
+        def parse(self, **kwargs):
+            calls.append(kwargs)
+            return [first_response, final_response][len(calls) - 1]
+
+    monkeypatch.setattr(
+        main,
+        "search_code",
+        lambda query: SearchCodeResult(
+            matches=(SearchResult(path="button.dart", line_number=7, text="class Button {}"),),
+            total_matches=1,
+            truncated=False,
+        ),
+    )
+    client = type("Client", (), {"responses": FakeResponses()})()
+
+    assert main.analyze_text("entry point", "Analyze related code.", client) is final_response
+    assert calls[1]["input"] == [
+        {
+            "type": "function_call_output",
+            "call_id": "call_789",
+            "output": (
+                '{"matches": [{"path": "button.dart", "line_number": 7, '
+                '"text": "class Button {}"}], "total_matches": 1, "truncated": false}'
+            ),
+        }
+    ]
+    terminal_output = capsys.readouterr().out
+    assert "Tool call: search_code(Button)" in terminal_output
+    assert "Tool result: found 1 matches (returned 1)" in terminal_output
+    assert '"total_matches": 1' in terminal_output
 
 
 def test_file_tool_errors_are_returned_to_the_model(monkeypatch) -> None:

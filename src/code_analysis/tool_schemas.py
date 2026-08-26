@@ -1,9 +1,30 @@
 """Schemas and implementations for custom code-analysis tools."""
 
+from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_APPROVED_DIRECTORY = Path("/Users/rombs/Documents/gits/door-opener/lib")
 ALLOWED_FILE_EXTENSION = ".dart"
+SEARCH_CODE_MAX_RESULTS = 30
+
+
+@dataclass(frozen=True)
+class SearchResult:
+    """One text match found by the ``search_code`` tool."""
+
+    path: str
+    line_number: int
+    text: str
+
+
+@dataclass(frozen=True)
+class SearchCodeResult:
+    """The returned search matches and the total number found."""
+
+    matches: tuple[SearchResult, ...]
+    total_matches: int
+    truncated: bool
+
 
 READ_SOURCE_LINE_TOOL = {
     "type": "function",
@@ -70,6 +91,30 @@ LIST_FILES_TOOL = {
 }
 
 
+SEARCH_CODE_TOOL = {
+    "type": "function",
+    "name": "search_code",
+    "description": (
+        "Search Dart source files in the approved project directory for text. Return an "
+        "object with: matches (up to 30 results, each with relative path, one-based line "
+        "number, and line text); total_matches (the count before limiting); and truncated "
+        "(whether additional matches were omitted)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The exact text to search for in Dart source files.",
+            }
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    },
+    "strict": True,
+}
+
+
 def read_source_line(source_text: str, line_number: int) -> str:
     """Return one one-based line from the source currently being analyzed.
 
@@ -111,6 +156,41 @@ def read_file(
         raise ValueError(f"file_path does not identify a file: {file_path}")
 
     return requested_path.read_text(encoding="utf-8")
+
+
+def search_code(
+    query: str,
+    approved_directory: Path = DEFAULT_APPROVED_DIRECTORY,
+) -> SearchCodeResult:
+    """Return up to 30 matches and metadata for all matches in approved Dart files."""
+    if not isinstance(query, str):
+        raise TypeError("query must be a string.")
+    if not query:
+        raise ValueError("query must not be empty.")
+
+    approved_path = approved_directory.resolve()
+    results = []
+    total_matches = 0
+
+    for source_path in sorted(approved_path.rglob(f"*{ALLOWED_FILE_EXTENSION}")):
+        if not source_path.is_file() or not source_path.resolve().is_relative_to(approved_path):
+            continue
+
+        result_path = str(source_path.relative_to(approved_path))
+        source_text = read_file(result_path, approved_path)
+        for line_number, line in enumerate(source_text.splitlines(), start=1):
+            if query not in line:
+                continue
+
+            total_matches += 1
+            if len(results) < SEARCH_CODE_MAX_RESULTS:
+                results.append(SearchResult(path=result_path, line_number=line_number, text=line))
+
+    return SearchCodeResult(
+        matches=tuple(results),
+        total_matches=total_matches,
+        truncated=total_matches > SEARCH_CODE_MAX_RESULTS,
+    )
 
 
 def list_files(
