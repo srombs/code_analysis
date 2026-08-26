@@ -9,10 +9,12 @@ from openai import OpenAI
 from pydantic import ValidationError
 
 from code_analysis.schemas import AnalysisResult, Finding  # noqa: F401
-from code_analysis.tool_schemas import READ_SOURCE_LINE_TOOL  # noqa: F401
+from code_analysis.tool_schemas import READ_SOURCE_FILE_TOOL, read_source_file
 
 MODEL = "gpt-5.6-luna"
+AGENT_INSTRUCTIONS = "You are a code-analysis agent. Return a structured analysis result."
 MAX_VALIDATION_RETRIES = 2
+MAX_TOOL_CALL_ROUNDS = 5
 INPUT_TOKEN_COST_PER_MILLION = 0.20
 OUTPUT_TOKEN_COST_PER_MILLION = 1.20
 
@@ -64,6 +66,9 @@ def validate_analysis_result_source_lines(
     numbered_source: str,
 ) -> None:
     """Ensure each finding references lines included in the model input."""
+    if not numbered_source:
+        return
+
     source_line_count = len(numbered_source.splitlines())
 
     for finding_number, finding in enumerate(result.findings, start=1):
@@ -72,6 +77,76 @@ def validate_analysis_result_source_lines(
                 f"Finding {finding_number} references lines {finding.start_line}-"
                 f"{finding.end_line}, but the input contains only {source_line_count} lines"
             )
+
+
+def execute_file_tool_calls(response: object) -> list[dict[str, str]]:
+    """Execute requested file reads and format their results for the API."""
+    tool_outputs = []
+
+    for output_item in getattr(response, "output", []):
+        if getattr(output_item, "type", None) != "function_call":
+            continue
+
+        try:
+            if output_item.name != READ_SOURCE_FILE_TOOL["name"]:
+                raise ValueError(f"unsupported tool: {output_item.name}")
+
+            arguments = json.loads(output_item.arguments)
+            if not isinstance(arguments, dict) or set(arguments) != {"file_path"}:
+                raise ValueError("tool arguments must contain only file_path")
+
+            file_path = arguments["file_path"]
+            print(f"Tool call: read_source_file({file_path})")
+            output = number_source_lines(read_source_file(file_path))
+            print(f"Tool result: read {file_path} ({len(output.splitlines())} lines)")
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            output = f"Could not read source file: {error}"
+            print(f"Tool error: {output}")
+
+        tool_outputs.append(
+            {
+                "type": "function_call_output",
+                "call_id": output_item.call_id,
+                "output": output,
+            }
+        )
+
+    return tool_outputs
+
+
+def request_analysis_with_tools(
+    text: str,
+    instructions: str,
+    client: OpenAI,
+) -> object:
+    """Request an analysis and service file-read calls until it is complete."""
+    request_options = {
+        "model": MODEL,
+        "instructions": AGENT_INSTRUCTIONS,
+        "text_format": AnalysisResult,
+        "tools": [READ_SOURCE_FILE_TOOL],
+        "tool_choice": "auto",
+    }
+    request_options["input"] = number_source_lines(text) if text else instructions
+
+    response = client.responses.parse(**request_options)
+
+    for tool_round in range(MAX_TOOL_CALL_ROUNDS):
+        tool_outputs = execute_file_tool_calls(response)
+        if not tool_outputs:
+            return response
+
+        response = client.responses.parse(
+            model=MODEL,
+            instructions=AGENT_INSTRUCTIONS,
+            input=tool_outputs,
+            previous_response_id=response.id,
+            text_format=AnalysisResult,
+            tools=[READ_SOURCE_FILE_TOOL],
+            tool_choice="auto",
+        )
+
+    raise AnalysisError(f"Model requested more than {MAX_TOOL_CALL_ROUNDS} rounds of file reads.")
 
 
 def analyze_text(
@@ -88,12 +163,7 @@ def analyze_text(
             if simulate_validation_error_once and attempt == 0:
                 AnalysisResult.model_validate({})
 
-            response = client.responses.parse(
-                model=MODEL,
-                instructions=instructions,
-                input=numbered_source,
-                text_format=AnalysisResult,
-            )
+            response = request_analysis_with_tools(text, instructions, client)
         except ValidationError as error:
             validation_error = error
         except Exception as error:
@@ -192,8 +262,7 @@ def format_analysis_metrics(response: object, elapsed_seconds: float) -> str:
 
 def main() -> None:
     """Analyze a text file supplied from the command line."""
-    parser = argparse.ArgumentParser(description="Analyze a piece of text.")
-    parser.add_argument("file_path", help="Path to the UTF-8 text file to analyze")
+    parser = argparse.ArgumentParser(description="Analyze source files with the available tools.")
     parser.add_argument("instructions", help="Instructions for the analysis")
     parser.add_argument(
         "--simulate-validation-error-once",
@@ -201,8 +270,6 @@ def main() -> None:
         help="Testing only: force one validation error before calling the API",
     )
     args = parser.parse_args()
-
-    text = read_text_file_with_retry(args.file_path)
 
     try:
         client = OpenAI()
@@ -213,7 +280,7 @@ def main() -> None:
 
     try:
         response = analyze_text(
-            text,
+            "",
             args.instructions,
             client,
             simulate_validation_error_once=args.simulate_validation_error_once,

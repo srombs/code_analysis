@@ -1,12 +1,19 @@
 import argparse
 import sys
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
 from code_analysis import main
 from code_analysis.schemas import AnalysisResult, Finding
-from code_analysis.tool_schemas import READ_SOURCE_LINE_TOOL, read_source_line
+from code_analysis.tool_schemas import (
+    DEFAULT_APPROVED_DIRECTORY,
+    READ_SOURCE_FILE_TOOL,
+    READ_SOURCE_LINE_TOOL,
+    read_source_file,
+    read_source_line,
+)
 
 
 def test_main_is_available() -> None:
@@ -33,6 +40,17 @@ def test_read_source_line_tool_schema_requires_a_positive_line_number() -> None:
     }
 
 
+def test_read_source_file_tool_schema_requires_a_file_path() -> None:
+    assert READ_SOURCE_FILE_TOOL["name"] == "read_source_file"
+    assert READ_SOURCE_FILE_TOOL["strict"] is True
+    assert READ_SOURCE_FILE_TOOL["parameters"]["required"] == ["file_path"]
+    assert READ_SOURCE_FILE_TOOL["parameters"]["properties"]["file_path"]["type"] == "string"
+
+
+def test_read_source_file_has_the_door_opener_lib_directory_as_its_default() -> None:
+    assert DEFAULT_APPROVED_DIRECTORY == Path("/Users/rombs/Documents/gits/door-opener/lib")
+
+
 def test_read_source_line_returns_the_requested_one_based_line() -> None:
     assert read_source_line("first\nsecond\nthird", 2) == "2: second"
 
@@ -46,6 +64,18 @@ def test_read_source_line_rejects_out_of_range_line_numbers(line_number: int) ->
 def test_read_source_line_rejects_a_non_integer_line_number() -> None:
     with pytest.raises(TypeError, match="must be an integer"):
         read_source_line("first", True)
+
+
+def test_read_source_file_returns_text_from_the_approved_directory(tmp_path) -> None:
+    source_file = tmp_path / "example.py"
+    source_file.write_text("print('hello')\n", encoding="utf-8")
+
+    assert read_source_file("example.py", tmp_path) == "print('hello')\n"
+
+
+def test_read_source_file_rejects_paths_outside_the_approved_directory(tmp_path) -> None:
+    with pytest.raises(ValueError, match="approved directory"):
+        read_source_file("../outside.txt", tmp_path)
 
 
 def test_main_uses_the_schemas_module_models() -> None:
@@ -196,9 +226,87 @@ def test_analyze_text_uses_luna_model() -> None:
     assert calls == [
         {
             "model": "gpt-5.6-luna",
-            "instructions": "Be concise.",
+            "instructions": main.AGENT_INSTRUCTIONS,
             "input": "1: first line\n2: second line",
             "text_format": main.AnalysisResult,
+            "tools": [main.READ_SOURCE_FILE_TOOL],
+            "tool_choice": "auto",
+        }
+    ]
+
+
+def test_analyze_text_executes_a_requested_file_read_and_returns_its_output(
+    monkeypatch,
+    capsys,
+) -> None:
+    tool_call = type(
+        "ToolCall",
+        (),
+        {
+            "type": "function_call",
+            "name": "read_source_file",
+            "arguments": '{"file_path": "widget.dart"}',
+            "call_id": "call_123",
+        },
+    )()
+    first_response = type(
+        "Response",
+        (),
+        {"id": "response_1", "output_parsed": None, "output": [tool_call]},
+    )()
+    parsed_result = main.AnalysisResult(summary="No issues found.", findings=[])
+    final_response = type(
+        "Response",
+        (),
+        {"output_parsed": parsed_result, "output": []},
+    )()
+    calls = []
+
+    class FakeResponses:
+        def parse(self, **kwargs):
+            calls.append(kwargs)
+            return [first_response, final_response][len(calls) - 1]
+
+    monkeypatch.setattr(main, "read_source_file", lambda file_path: "class Widget {}\n")
+    client = type("Client", (), {"responses": FakeResponses()})()
+
+    assert main.analyze_text("entry point", "Analyze related code.", client) is final_response
+    assert calls[1]["input"] == [
+        {
+            "type": "function_call_output",
+            "call_id": "call_123",
+            "output": "1: class Widget {}",
+        }
+    ]
+    assert calls[1]["previous_response_id"] == "response_1"
+    assert capsys.readouterr().out == (
+        "Tool call: read_source_file(widget.dart)\nTool result: read widget.dart (1 lines)\n"
+    )
+
+
+def test_file_tool_errors_are_returned_to_the_model(monkeypatch) -> None:
+    tool_call = type(
+        "ToolCall",
+        (),
+        {
+            "type": "function_call",
+            "name": "read_source_file",
+            "arguments": '{"file_path": "../.env"}',
+            "call_id": "call_123",
+        },
+    )()
+    response = type("Response", (), {"output": [tool_call]})()
+    monkeypatch.setattr(
+        main,
+        "read_source_file",
+        lambda file_path: (_ for _ in ()).throw(ValueError("path is not allowed")),
+    )
+
+    assert main.execute_file_tool_calls(response) == [
+        {
+            "type": "function_call_output",
+            "call_id": "call_123",
+            "output": "Could not read source file: path is not allowed",
         }
     ]
 
@@ -428,10 +536,9 @@ def test_main_prints_model_response(monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         sys,
         "argv",
-        ["code-analysis", "example.py", "Be concise."],
+        ["code-analysis", "Be concise."],
     )
     monkeypatch.setattr(main, "OpenAI", lambda: object())
-    monkeypatch.setattr(main, "read_text_file_with_retry", lambda file_path: "hello world")
     response = type("Response", (), {"output_parsed": object()})()
     monkeypatch.setattr(
         main,
@@ -455,8 +562,7 @@ def test_main_prints_model_response(monkeypatch, capsys) -> None:
 
 
 def test_main_reports_analysis_errors(monkeypatch, capsys) -> None:
-    monkeypatch.setattr(sys, "argv", ["code-analysis", "example.py", "Be concise."])
-    monkeypatch.setattr(main, "read_text_file_with_retry", lambda file_path: "hello world")
+    monkeypatch.setattr(sys, "argv", ["code-analysis", "Be concise."])
     monkeypatch.setattr(main, "OpenAI", lambda: object())
     monkeypatch.setattr(
         main,
