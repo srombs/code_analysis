@@ -3,7 +3,7 @@
 import argparse
 import json
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from openai import OpenAI
@@ -15,13 +15,15 @@ from code_analysis.tool_schemas import (
     READ_FILE_TOOL,
     SEARCH_CODE_TOOL,
     FileState,
+    ToolPermission,
+    get_tool_permissions,
     list_files,
     read_file,
     search_code,
 )
 
 MODEL = "gpt-5.6-luna"
-AGENT_INSTRUCTIONS = "You are a code-analysis agent. Return a structured analysis result."
+AGENT_INSTRUCTIONS = "You are a code-analysis agent. Do not make claims about implementation unless those claims are supported by files you have inspected using the available tools. Return a structured analysis result. "
 MAX_VALIDATION_RETRIES = 2
 MAX_TOOL_CALL_ROUNDS = 15
 INPUT_TOKEN_COST_PER_MILLION = 0.20
@@ -30,6 +32,37 @@ OUTPUT_TOKEN_COST_PER_MILLION = 1.20
 
 class AnalysisError(Exception):
     """Raised when the model request cannot be completed."""
+
+
+@dataclass(frozen=True)
+class PermissionPolicy:
+    """The permissions this app run grants to model-requested tools."""
+
+    allowed_permissions: frozenset[ToolPermission]
+
+    def allows(self, tool_name: str) -> bool:
+        """Return whether every permission required by a known tool is allowed."""
+        required_permissions = get_tool_permissions(tool_name)
+        return bool(required_permissions) and required_permissions <= self.allowed_permissions
+
+
+DEFAULT_PERMISSION_POLICY = PermissionPolicy(frozenset({ToolPermission.READ}))
+
+
+def permission_policy_from_cli_values(
+    values: list[str] | None,
+) -> PermissionPolicy:
+    """Build a policy from repeatable CLI values, defaulting to read-only access."""
+    if values is None:
+        return DEFAULT_PERMISSION_POLICY
+
+    return PermissionPolicy(frozenset(ToolPermission(value) for value in values))
+
+
+def format_permission_policy(permission_policy: PermissionPolicy) -> str:
+    """Format the active permissions for the terminal."""
+    permissions = ", ".join(sorted(permission_policy.allowed_permissions)) or "none"
+    return f"Allowed permissions: {permissions}"
 
 
 def read_text_file(file_path: str) -> str:
@@ -88,7 +121,10 @@ def validate_analysis_result_source_lines(
             )
 
 
-def execute_file_tool_calls(response: object) -> list[dict[str, str]]:
+def execute_file_tool_calls(
+    response: object,
+    permission_policy: PermissionPolicy = DEFAULT_PERMISSION_POLICY,
+) -> list[dict[str, str]]:
     """Execute requested file tools and format their results for the API."""
     tool_outputs = []
 
@@ -98,6 +134,13 @@ def execute_file_tool_calls(response: object) -> list[dict[str, str]]:
 
         try:
             arguments = json.loads(output_item.arguments)
+            if not permission_policy.allows(output_item.name):
+                required_permissions = ", ".join(sorted(get_tool_permissions(output_item.name)))
+                raise PermissionError(
+                    f"Tool '{output_item.name}' is not allowed. Required permissions: "
+                    f"{required_permissions or 'unknown'}."
+                )
+
             if output_item.name == READ_FILE_TOOL["name"]:
                 if not isinstance(arguments, dict) or set(arguments) != {"file_path"}:
                     raise ValueError("tool arguments must contain only file_path")
@@ -156,6 +199,7 @@ def request_analysis_with_tools(
     text: str,
     instructions: str,
     client: OpenAI,
+    permission_policy: PermissionPolicy = DEFAULT_PERMISSION_POLICY,
 ) -> object:
     """Request an analysis and service file-read calls until it is complete."""
     request_options = {
@@ -170,7 +214,7 @@ def request_analysis_with_tools(
     response = client.responses.parse(**request_options)
 
     for tool_round in range(MAX_TOOL_CALL_ROUNDS):
-        tool_outputs = execute_file_tool_calls(response)
+        tool_outputs = execute_file_tool_calls(response, permission_policy)
         if not tool_outputs:
             return response
 
@@ -192,6 +236,7 @@ def analyze_text(
     instructions: str,
     client: OpenAI,
     simulate_validation_error_once: bool = False,
+    permission_policy: PermissionPolicy = DEFAULT_PERMISSION_POLICY,
 ) -> object:
     """Send text for analysis and return a response containing an AnalysisResult."""
     numbered_source = number_source_lines(text)
@@ -201,7 +246,7 @@ def analyze_text(
             if simulate_validation_error_once and attempt == 0:
                 AnalysisResult.model_validate({})
 
-            response = request_analysis_with_tools(text, instructions, client)
+            response = request_analysis_with_tools(text, instructions, client, permission_policy)
         except ValidationError as error:
             validation_error = error
         except Exception as error:
@@ -307,7 +352,18 @@ def main() -> None:
         action="store_true",
         help="Testing only: force one validation error before calling the API",
     )
+    parser.add_argument(
+        "--allow-permission",
+        action="append",
+        choices=[permission.value for permission in ToolPermission],
+        metavar="PERMISSION",
+        help=(
+            "Grant a tool permission; repeat for multiple permissions. "
+            "When omitted, only read is allowed."
+        ),
+    )
     args = parser.parse_args()
+    permission_policy = permission_policy_from_cli_values(args.allow_permission)
 
     try:
         client = OpenAI()
@@ -315,6 +371,7 @@ def main() -> None:
         parser.error(f"could not initialize OpenAI client: {error}")
 
     analysis_started_at = time.perf_counter()
+    print(format_permission_policy(permission_policy))
 
     try:
         response = analyze_text(
@@ -322,6 +379,7 @@ def main() -> None:
             args.instructions,
             client,
             simulate_validation_error_once=args.simulate_validation_error_once,
+            permission_policy=permission_policy,
         )
     except AnalysisError as error:
         parser.error(str(error))

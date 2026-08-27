@@ -10,6 +10,7 @@ from code_analysis.schemas import AnalysisResult, Finding
 from code_analysis.tool_schemas import (
     APPROVED_DIRECTORIES,
     LIST_FILES_TOOL,
+    MAX_FILE_SIZE_BYTES,
     READ_FILE_TOOL,
     READ_SOURCE_LINE_TOOL,
     SEARCH_CODE_MAX_RESULTS,
@@ -17,6 +18,8 @@ from code_analysis.tool_schemas import (
     FileState,
     SearchCodeResult,
     SearchResult,
+    ToolPermission,
+    get_tool_permissions,
     list_files,
     read_file,
     read_source_line,
@@ -69,6 +72,60 @@ def test_search_code_tool_schema_requires_a_query() -> None:
     assert SEARCH_CODE_TOOL["strict"] is True
     assert SEARCH_CODE_TOOL["parameters"]["required"] == ["query"]
     assert SEARCH_CODE_TOOL["parameters"]["properties"]["query"]["type"] == "string"
+
+
+def test_tool_permissions_describe_the_current_read_only_tools() -> None:
+    assert set(ToolPermission) == {
+        ToolPermission.READ,
+        ToolPermission.WRITE,
+        ToolPermission.EXTERNAL,
+        ToolPermission.EXECUTE,
+    }
+    assert get_tool_permissions(READ_FILE_TOOL["name"]) == frozenset({ToolPermission.READ})
+    assert get_tool_permissions(LIST_FILES_TOOL["name"]) == frozenset({ToolPermission.READ})
+    assert get_tool_permissions(SEARCH_CODE_TOOL["name"]) == frozenset({ToolPermission.READ})
+    assert get_tool_permissions("unknown_tool") == frozenset()
+
+
+def test_permission_policy_defaults_to_read_only_and_honors_cli_values() -> None:
+    assert main.permission_policy_from_cli_values(None) == main.DEFAULT_PERMISSION_POLICY
+    assert main.DEFAULT_PERMISSION_POLICY.allows(READ_FILE_TOOL["name"])
+    assert (
+        main.format_permission_policy(main.DEFAULT_PERMISSION_POLICY) == "Allowed permissions: read"
+    )
+
+    explicit_policy = main.permission_policy_from_cli_values(["write", "external"])
+
+    assert explicit_policy.allowed_permissions == frozenset(
+        {ToolPermission.WRITE, ToolPermission.EXTERNAL}
+    )
+    assert explicit_policy.allows(READ_FILE_TOOL["name"]) is False
+
+
+def test_permission_policy_rejects_a_tool_without_its_required_permission() -> None:
+    tool_call = type(
+        "ToolCall",
+        (),
+        {
+            "type": "function_call",
+            "name": "read_file",
+            "arguments": '{"file_path": "widget.dart"}',
+            "call_id": "call_123",
+        },
+    )()
+    response = type("Response", (), {"output": [tool_call]})()
+    no_permissions = main.PermissionPolicy(frozenset())
+
+    assert main.execute_file_tool_calls(response, no_permissions) == [
+        {
+            "type": "function_call_output",
+            "call_id": "call_123",
+            "output": (
+                "Could not execute file tool: Tool 'read_file' is not allowed. "
+                "Required permissions: read."
+            ),
+        }
+    ]
 
 
 def test_search_result_represents_a_code_match() -> None:
@@ -134,7 +191,7 @@ def test_read_file_returns_text_from_the_approved_directory(tmp_path) -> None:
 
 
 def test_read_file_rejects_paths_outside_the_approved_directory(tmp_path) -> None:
-    with pytest.raises(ValueError, match="approved directory"):
+    with pytest.raises(PermissionError, match="Access is not available outside"):
         read_file("../outside.txt", (tmp_path,))
 
 
@@ -142,6 +199,16 @@ def test_read_file_allows_non_dart_text_files(tmp_path) -> None:
     (tmp_path / "settings.json").write_text("{}", encoding="utf-8")
 
     assert read_file("settings.json", (tmp_path,)) == "{}"
+
+
+def test_read_file_rejects_files_larger_than_ten_mebibytes(tmp_path) -> None:
+    source_file = tmp_path / "large_source.dart"
+    source_file.touch()
+    with source_file.open("wb") as file:
+        file.truncate(MAX_FILE_SIZE_BYTES + 1)
+
+    with pytest.raises(ValueError, match="too large"):
+        read_file("large_source.dart", (tmp_path,))
 
 
 @pytest.mark.parametrize(
@@ -244,7 +311,7 @@ def test_list_files_hides_protected_files_and_directories(tmp_path) -> None:
 
 
 def test_list_files_rejects_paths_outside_the_approved_directory(tmp_path) -> None:
-    with pytest.raises(ValueError, match="approved directory"):
+    with pytest.raises(PermissionError, match="Access is not available outside"):
         list_files("../", (tmp_path,))
 
 
@@ -827,7 +894,9 @@ def test_main_prints_model_response(monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         main,
         "analyze_text",
-        lambda text, instructions, client, simulate_validation_error_once: response,
+        lambda text, instructions, client, simulate_validation_error_once, permission_policy: (
+            response
+        ),
     )
     monkeypatch.setattr(main, "format_response", lambda response: "Full API response")
     monkeypatch.setattr(
@@ -842,7 +911,9 @@ def test_main_prints_model_response(monkeypatch, capsys) -> None:
 
     main.main()
 
-    assert capsys.readouterr().out == "Formatted analysis result\nMetrics\n"
+    assert (
+        capsys.readouterr().out == "Allowed permissions: read\nFormatted analysis result\nMetrics\n"
+    )
 
 
 def test_main_reports_analysis_errors(monkeypatch, capsys) -> None:

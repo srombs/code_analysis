@@ -1,6 +1,7 @@
 """Schemas and implementations for custom code-analysis tools."""
 
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 APPROVED_DIRECTORIES = (
@@ -39,6 +40,16 @@ PROTECTED_FILE_NAMES = frozenset(
 PROTECTED_DIRECTORY_NAMES = frozenset({".aws", ".git", ".hg", ".ssh", ".svn"})
 SEARCH_FILE_EXTENSION = ".dart"
 SEARCH_CODE_MAX_RESULTS = 30
+MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024
+
+
+class ToolPermission(StrEnum):
+    """Permission categories enforced by this application, not the OpenAI API."""
+
+    READ = "read"
+    WRITE = "write"
+    EXTERNAL = "external"
+    EXECUTE = "execute"
 
 
 @dataclass(frozen=True)
@@ -93,7 +104,8 @@ READ_FILE_TOOL = {
     "name": "read_file",
     "description": (
         "Read a UTF-8 text file from an approved project directory. Secret, credential, "
-        "and version-control files are protected and cannot be read. Relative "
+        "and version-control files are protected and cannot be read. Files larger than "
+        "10 MiB cannot be read. Relative "
         "paths are rooted at /Users/rombs/Documents/gits/door-opener/lib. To read "
         "FW_IMP, use an absolute path under /Users/rombs/Documents/gits/FW_IMP. "
         "Return an object with file_path, line_count, and numbered_content."
@@ -164,6 +176,20 @@ SEARCH_CODE_TOOL = {
 }
 
 
+# Keep authorization metadata separate from the schemas sent to the model.
+TOOL_PERMISSIONS: dict[str, frozenset[ToolPermission]] = {
+    READ_SOURCE_LINE_TOOL["name"]: frozenset({ToolPermission.READ}),
+    READ_FILE_TOOL["name"]: frozenset({ToolPermission.READ}),
+    LIST_FILES_TOOL["name"]: frozenset({ToolPermission.READ}),
+    SEARCH_CODE_TOOL["name"]: frozenset({ToolPermission.READ}),
+}
+
+
+def get_tool_permissions(tool_name: str) -> frozenset[ToolPermission]:
+    """Return the permissions a tool requires, or none for an unknown tool."""
+    return TOOL_PERMISSIONS.get(tool_name, frozenset())
+
+
 def read_source_line(source_text: str, line_number: int) -> str:
     """Return one one-based line from the source currently being analyzed.
 
@@ -203,7 +229,9 @@ def _resolve_approved_path(
     resolved_path = path.resolve() if path.is_absolute() else (approved_paths[0] / path).resolve()
 
     if not any(resolved_path.is_relative_to(approved_path) for approved_path in approved_paths):
-        raise ValueError(f"{path_name} must stay inside an approved directory.")
+        raise PermissionError(
+            f"Access is not available outside the approved directories: {path_name}."
+        )
 
     return resolved_path, approved_paths
 
@@ -252,6 +280,12 @@ def read_file(
         raise ValueError("file_path identifies a protected file or directory.")
     if not requested_path.is_file():
         raise ValueError(f"file_path does not identify a file: {file_path}")
+    file_size_bytes = requested_path.stat().st_size
+    if file_size_bytes > MAX_FILE_SIZE_BYTES:
+        raise ValueError(
+            f"file_path is too large ({file_size_bytes} bytes); the maximum is "
+            f"{MAX_FILE_SIZE_BYTES} bytes."
+        )
 
     return requested_path.read_text(encoding="utf-8")
 
