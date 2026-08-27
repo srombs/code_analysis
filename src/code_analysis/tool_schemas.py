@@ -3,8 +3,41 @@
 from dataclasses import dataclass
 from pathlib import Path
 
-DEFAULT_APPROVED_DIRECTORY = Path("/Users/rombs/Documents/gits/door-opener/lib")
-ALLOWED_FILE_EXTENSION = ".dart"
+APPROVED_DIRECTORIES = (
+    Path("/Users/rombs/Documents/gits/door-opener/lib"),
+    Path("/Users/rombs/Documents/gits/FW_IMP"),
+)
+PROTECTED_FILE_SUFFIXES = frozenset(
+    {
+        ".cer",
+        ".crt",
+        ".der",
+        ".jks",
+        ".kdbx",
+        ".key",
+        ".keystore",
+        ".mobileprovision",
+        ".p12",
+        ".pem",
+        ".pfx",
+        ".ppk",
+    }
+)
+PROTECTED_FILE_NAMES = frozenset(
+    {
+        ".ds_store",
+        ".env",
+        ".netrc",
+        ".npmrc",
+        ".pypirc",
+        "id_dsa",
+        "id_ecdsa",
+        "id_ed25519",
+        "id_rsa",
+    }
+)
+PROTECTED_DIRECTORY_NAMES = frozenset({".aws", ".git", ".hg", ".ssh", ".svn"})
+SEARCH_FILE_EXTENSION = ".dart"
 SEARCH_CODE_MAX_RESULTS = 30
 
 
@@ -59,15 +92,18 @@ READ_FILE_TOOL = {
     "type": "function",
     "name": "read_file",
     "description": (
-        "Read a UTF-8 Dart source file from the approved project directory. Return an "
-        "object with file_path, line_count, and numbered_content."
+        "Read a UTF-8 text file from an approved project directory. Secret, credential, "
+        "and version-control files are protected and cannot be read. Relative "
+        "paths are rooted at /Users/rombs/Documents/gits/door-opener/lib. To read "
+        "FW_IMP, use an absolute path under /Users/rombs/Documents/gits/FW_IMP. "
+        "Return an object with file_path, line_count, and numbered_content."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "file_path": {
                 "type": "string",
-                "description": "The relative path of the .dart source file to read.",
+                "description": "A non-protected text-file path within an approved directory.",
             }
         },
         "required": ["file_path"],
@@ -81,9 +117,10 @@ LIST_FILES_TOOL = {
     "type": "function",
     "name": "list_files",
     "description": (
-        "List files and subdirectories in a directory inside the approved project "
-        "directory. Returned directories end with a slash and can be passed to this "
-        "tool again."
+        "List files and subdirectories inside an approved directory. Relative paths are "
+        "rooted at /Users/rombs/Documents/gits/door-opener/lib. To browse FW_IMP, "
+        "start with /Users/rombs/Documents/gits/FW_IMP. Returned directories end with "
+        "a slash and can be passed to this tool again."
     ),
     "parameters": {
         "type": "object",
@@ -91,8 +128,8 @@ LIST_FILES_TOOL = {
             "directory_path": {
                 "type": "string",
                 "description": (
-                    "The relative directory path to list. Use an empty string to list "
-                    "the approved project directory root."
+                    "A directory path within an approved directory. Use an empty string "
+                    "to list the Door Opener root."
                 ),
             }
         },
@@ -107,10 +144,10 @@ SEARCH_CODE_TOOL = {
     "type": "function",
     "name": "search_code",
     "description": (
-        "Search Dart source files in the approved project directory for text. Return an "
-        "object with: matches (up to 30 results, each with relative path, one-based line "
-        "number, and line text); total_matches (the count before limiting); and truncated "
-        "(whether additional matches were omitted)."
+        "Search Dart source files in every approved directory for text. Return an object "
+        "with: matches (up to 30 results, each with a path, one-based line number, and "
+        "line text); total_matches (the count before limiting); and truncated (whether "
+        "additional matches were omitted)."
     ),
     "parameters": {
         "type": "object",
@@ -145,25 +182,74 @@ def read_source_line(source_text: str, line_number: int) -> str:
     return f"{line_number}: {source_lines[line_number - 1]}"
 
 
+def _resolved_approved_directories(
+    approved_directories: tuple[Path, ...],
+) -> tuple[Path, ...]:
+    """Resolve the app-controlled directories allowed for file tools."""
+    if not approved_directories:
+        raise ValueError("At least one approved directory is required.")
+
+    return tuple(directory.resolve() for directory in approved_directories)
+
+
+def _resolve_approved_path(
+    requested_path: str,
+    approved_directories: tuple[Path, ...],
+    path_name: str,
+) -> tuple[Path, tuple[Path, ...]]:
+    """Resolve a requested path and ensure it belongs to an allowed directory."""
+    approved_paths = _resolved_approved_directories(approved_directories)
+    path = Path(requested_path)
+    resolved_path = path.resolve() if path.is_absolute() else (approved_paths[0] / path).resolve()
+
+    if not any(resolved_path.is_relative_to(approved_path) for approved_path in approved_paths):
+        raise ValueError(f"{path_name} must stay inside an approved directory.")
+
+    return resolved_path, approved_paths
+
+
+def _path_for_model(path: Path, approved_directories: tuple[Path, ...]) -> str:
+    """Keep Door Opener paths relative; make other-root paths unambiguous."""
+    primary_directory = approved_directories[0]
+    if path.is_relative_to(primary_directory):
+        return str(path.relative_to(primary_directory))
+
+    return str(path)
+
+
+def _is_protected_path(path: Path) -> bool:
+    """Return whether a path looks like a secret or version-control artifact."""
+    normalized_name = path.name.casefold()
+    normalized_parts = (part.casefold() for part in path.parts)
+
+    return (
+        normalized_name in PROTECTED_FILE_NAMES
+        or normalized_name.startswith(".env.")
+        or path.suffix.casefold() in PROTECTED_FILE_SUFFIXES
+        or any(part in PROTECTED_DIRECTORY_NAMES for part in normalized_parts)
+    )
+
+
 def read_file(
     file_path: str,
-    approved_directory: Path = DEFAULT_APPROVED_DIRECTORY,
+    approved_directories: tuple[Path, ...] = APPROVED_DIRECTORIES,
 ) -> str:
-    """Read a UTF-8 Dart file only when it is inside ``approved_directory``.
+    """Read a UTF-8 text file only when it is inside an approved directory.
 
-    ``file_path`` is the value requested by the model. ``approved_directory``
+    ``file_path`` is the value requested by the model. ``approved_directories``
     comes from the app, never from the model, so the app keeps control over
     which files may be exposed.
     """
     if not isinstance(file_path, str):
         raise TypeError("file_path must be a string.")
 
-    approved_path = approved_directory.resolve()
-    requested_path = (approved_path / file_path).resolve()
-    if not requested_path.is_relative_to(approved_path):
-        raise ValueError("file_path must stay inside the approved directory.")
-    if requested_path.suffix != ALLOWED_FILE_EXTENSION:
-        raise ValueError(f"file_path must have the {ALLOWED_FILE_EXTENSION} extension.")
+    requested_path, _ = _resolve_approved_path(
+        file_path,
+        approved_directories,
+        "file_path",
+    )
+    if _is_protected_path(requested_path):
+        raise ValueError("file_path identifies a protected file or directory.")
     if not requested_path.is_file():
         raise ValueError(f"file_path does not identify a file: {file_path}")
 
@@ -172,31 +258,38 @@ def read_file(
 
 def search_code(
     query: str,
-    approved_directory: Path = DEFAULT_APPROVED_DIRECTORY,
+    approved_directories: tuple[Path, ...] = APPROVED_DIRECTORIES,
 ) -> SearchCodeResult:
-    """Return up to 30 matches and metadata for all matches in approved Dart files."""
+    """Return up to 30 matches and metadata for all approved Dart files."""
     if not isinstance(query, str):
         raise TypeError("query must be a string.")
     if not query:
         raise ValueError("query must not be empty.")
 
-    approved_path = approved_directory.resolve()
+    approved_paths = _resolved_approved_directories(approved_directories)
     results = []
     total_matches = 0
 
-    for source_path in sorted(approved_path.rglob(f"*{ALLOWED_FILE_EXTENSION}")):
-        if not source_path.is_file() or not source_path.resolve().is_relative_to(approved_path):
-            continue
-
-        result_path = str(source_path.relative_to(approved_path))
-        source_text = read_file(result_path, approved_path)
-        for line_number, line in enumerate(source_text.splitlines(), start=1):
-            if query not in line:
+    for approved_path in approved_paths:
+        for source_path in sorted(approved_path.rglob(f"*{SEARCH_FILE_EXTENSION}")):
+            if (
+                not source_path.is_file()
+                or _is_protected_path(source_path)
+                or not source_path.resolve().is_relative_to(approved_path)
+            ):
                 continue
 
-            total_matches += 1
-            if len(results) < SEARCH_CODE_MAX_RESULTS:
-                results.append(SearchResult(path=result_path, line_number=line_number, text=line))
+            result_path = _path_for_model(source_path, approved_paths)
+            source_text = read_file(str(source_path), approved_paths)
+            for line_number, line in enumerate(source_text.splitlines(), start=1):
+                if query not in line:
+                    continue
+
+                total_matches += 1
+                if len(results) < SEARCH_CODE_MAX_RESULTS:
+                    results.append(
+                        SearchResult(path=result_path, line_number=line_number, text=line)
+                    )
 
     return SearchCodeResult(
         matches=tuple(results),
@@ -207,25 +300,29 @@ def search_code(
 
 def list_files(
     directory_path: str,
-    approved_directory: Path = DEFAULT_APPROVED_DIRECTORY,
+    approved_directories: tuple[Path, ...] = APPROVED_DIRECTORIES,
 ) -> str:
-    """List direct files and directories as paths relative to the approved root."""
+    """List direct files and directories inside an approved directory."""
     if not isinstance(directory_path, str):
         raise TypeError("directory_path must be a string.")
 
-    approved_path = approved_directory.resolve()
-    requested_path = (approved_path / directory_path).resolve()
-    if not requested_path.is_relative_to(approved_path):
-        raise ValueError("directory_path must stay inside the approved directory.")
+    requested_path, approved_paths = _resolve_approved_path(
+        directory_path,
+        approved_directories,
+        "directory_path",
+    )
     if not requested_path.is_dir():
         raise ValueError(f"directory_path does not identify a directory: {directory_path}")
 
     paths = []
     for path in sorted(requested_path.iterdir()):
-        relative_path = str(path.relative_to(approved_path))
+        if _is_protected_path(path):
+            continue
+
+        model_path = _path_for_model(path, approved_paths)
         if path.is_dir():
-            paths.append(f"{relative_path}/")
+            paths.append(f"{model_path}/")
         elif path.is_file():
-            paths.append(relative_path)
+            paths.append(model_path)
 
     return "\n".join(paths)

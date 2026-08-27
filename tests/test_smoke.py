@@ -8,7 +8,7 @@ from pydantic import ValidationError
 from code_analysis import main
 from code_analysis.schemas import AnalysisResult, Finding
 from code_analysis.tool_schemas import (
-    DEFAULT_APPROVED_DIRECTORY,
+    APPROVED_DIRECTORIES,
     LIST_FILES_TOOL,
     READ_FILE_TOOL,
     READ_SOURCE_LINE_TOOL,
@@ -104,8 +104,11 @@ def test_file_state_contains_file_metadata_and_numbered_content() -> None:
     assert state.numbered_content == "1: class Button {}\n2: "
 
 
-def test_read_file_has_the_door_opener_lib_directory_as_its_default() -> None:
-    assert DEFAULT_APPROVED_DIRECTORY == Path("/Users/rombs/Documents/gits/door-opener/lib")
+def test_file_tools_have_both_project_directories_approved() -> None:
+    assert APPROVED_DIRECTORIES == (
+        Path("/Users/rombs/Documents/gits/door-opener/lib"),
+        Path("/Users/rombs/Documents/gits/FW_IMP"),
+    )
 
 
 def test_read_source_line_returns_the_requested_one_based_line() -> None:
@@ -127,19 +130,55 @@ def test_read_file_returns_text_from_the_approved_directory(tmp_path) -> None:
     source_file = tmp_path / "example.dart"
     source_file.write_text("print('hello')\n", encoding="utf-8")
 
-    assert read_file("example.dart", tmp_path) == "print('hello')\n"
+    assert read_file("example.dart", (tmp_path,)) == "print('hello')\n"
 
 
 def test_read_file_rejects_paths_outside_the_approved_directory(tmp_path) -> None:
     with pytest.raises(ValueError, match="approved directory"):
-        read_file("../outside.txt", tmp_path)
+        read_file("../outside.txt", (tmp_path,))
 
 
-def test_read_file_rejects_non_dart_files(tmp_path) -> None:
+def test_read_file_allows_non_dart_text_files(tmp_path) -> None:
     (tmp_path / "settings.json").write_text("{}", encoding="utf-8")
 
-    with pytest.raises(ValueError, match=r"must have the \.dart extension"):
-        read_file("settings.json", tmp_path)
+    assert read_file("settings.json", (tmp_path,)) == "{}"
+
+
+@pytest.mark.parametrize(
+    "file_name",
+    [".DS_Store", ".env", ".env.local", "private.pem", "id_rsa"],
+)
+def test_read_file_rejects_common_protected_files(tmp_path, file_name: str) -> None:
+    (tmp_path / file_name).write_text("secret", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="protected"):
+        read_file(file_name, (tmp_path,))
+
+
+def test_file_tools_allow_each_approved_directory(tmp_path) -> None:
+    primary_directory = tmp_path / "primary"
+    secondary_directory = tmp_path / "secondary"
+    primary_directory.mkdir()
+    secondary_directory.mkdir()
+    (primary_directory / "primary.dart").write_text("primary match", encoding="utf-8")
+    secondary_file = secondary_directory / "secondary.dart"
+    secondary_file.write_text("secondary match", encoding="utf-8")
+    approved_directories = (primary_directory, secondary_directory)
+
+    assert read_file(str(secondary_file), approved_directories) == "secondary match"
+    assert list_files(str(secondary_directory), approved_directories) == str(secondary_file)
+    assert search_code("match", approved_directories) == SearchCodeResult(
+        matches=(
+            SearchResult(path="primary.dart", line_number=1, text="primary match"),
+            SearchResult(
+                path=str(secondary_file),
+                line_number=1,
+                text="secondary match",
+            ),
+        ),
+        total_matches=2,
+        truncated=False,
+    )
 
 
 def test_search_code_returns_a_result_for_each_matching_line(tmp_path) -> None:
@@ -152,7 +191,7 @@ def test_search_code_returns_a_result_for_each_matching_line(tmp_path) -> None:
     (widgets_directory / "button.dart").write_text("find this too\n", encoding="utf-8")
     (tmp_path / "ignored.txt").write_text("find this\n", encoding="utf-8")
 
-    assert search_code("find this", tmp_path) == SearchCodeResult(
+    assert search_code("find this", (tmp_path,)) == SearchCodeResult(
         matches=(
             SearchResult(path="example.dart", line_number=2, text="find this"),
             SearchResult(path="widgets/button.dart", line_number=1, text="find this too"),
@@ -166,7 +205,7 @@ def test_search_code_rejects_an_empty_query(tmp_path) -> None:
     (tmp_path / "example.dart").write_text("anything", encoding="utf-8")
 
     with pytest.raises(ValueError, match="must not be empty"):
-        search_code("", tmp_path)
+        search_code("", (tmp_path,))
 
 
 def test_search_code_stops_after_thirty_matches(tmp_path) -> None:
@@ -175,7 +214,7 @@ def test_search_code_stops_after_thirty_matches(tmp_path) -> None:
         encoding="utf-8",
     )
 
-    result = search_code("match", tmp_path)
+    result = search_code("match", (tmp_path,))
 
     assert len(result.matches) == SEARCH_CODE_MAX_RESULTS
     assert result.matches[0].line_number == 1
@@ -191,13 +230,22 @@ def test_list_files_returns_sorted_paths_relative_to_the_approved_directory(tmp_
     (subdirectory / "button.py").write_text("", encoding="utf-8")
     (subdirectory / "input.py").write_text("", encoding="utf-8")
 
-    assert list_files("widgets", tmp_path) == "widgets/button.py\nwidgets/input.py"
-    assert list_files("", tmp_path) == "widgets/\nzebra.py"
+    assert list_files("widgets", (tmp_path,)) == "widgets/button.py\nwidgets/input.py"
+    assert list_files("", (tmp_path,)) == "widgets/\nzebra.py"
+
+
+def test_list_files_hides_protected_files_and_directories(tmp_path) -> None:
+    (tmp_path / ".env").write_text("secret", encoding="utf-8")
+    (tmp_path / "private.pem").write_text("secret", encoding="utf-8")
+    (tmp_path / "source.py").write_text("print('safe')", encoding="utf-8")
+    (tmp_path / ".git").mkdir()
+
+    assert list_files("", (tmp_path,)) == "source.py"
 
 
 def test_list_files_rejects_paths_outside_the_approved_directory(tmp_path) -> None:
     with pytest.raises(ValueError, match="approved directory"):
-        list_files("../", tmp_path)
+        list_files("../", (tmp_path,))
 
 
 def test_main_uses_the_schemas_module_models() -> None:
