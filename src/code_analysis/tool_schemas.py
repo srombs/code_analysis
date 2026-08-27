@@ -1,5 +1,6 @@
 """Schemas and implementations for custom code-analysis tools."""
 
+import subprocess
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -8,6 +9,7 @@ APPROVED_DIRECTORIES = (
     Path("/Users/rombs/Documents/gits/door-opener/lib"),
     Path("/Users/rombs/Documents/gits/FW_IMP"),
 )
+FLUTTER_PROJECT_DIRECTORY = Path("/Users/rombs/Documents/gits/door-opener")
 PROTECTED_FILE_SUFFIXES = frozenset(
     {
         ".cer",
@@ -77,6 +79,33 @@ class FileState:
     file_path: str
     line_count: int
     numbered_content: str
+
+
+@dataclass(frozen=True)
+class FlutterTestResult:
+    """The outcome and terminal output from one Flutter test-suite run."""
+
+    exit_code: int
+    stdout: str
+    stderr: str
+
+
+@dataclass(frozen=True)
+class DartAnalyzeResult:
+    """The outcome and terminal output from one Dart analyzer run."""
+
+    exit_code: int
+    stdout: str
+    stderr: str
+
+
+@dataclass(frozen=True)
+class DartFormatResult:
+    """The outcome and terminal output from one Dart formatter run."""
+
+    exit_code: int
+    stdout: str
+    stderr: str
 
 
 READ_SOURCE_LINE_TOOL = {
@@ -176,12 +205,69 @@ SEARCH_CODE_TOOL = {
 }
 
 
+RUN_FLUTTER_TESTS_TOOL = {
+    "type": "function",
+    "name": "run_flutter_tests",
+    "description": (
+        "Run the full Flutter test suite with `flutter test` in the fixed Door Opener "
+        "project. This executes project code and requires execute permission. Return the "
+        "process exit code, standard output, and standard error."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": False,
+    },
+    "strict": True,
+}
+
+
+RUN_DART_ANALYZE_TOOL = {
+    "type": "function",
+    "name": "run_dart_analyze",
+    "description": (
+        "Run `dart analyze` in the fixed Door Opener Flutter project. This executes the "
+        "Dart analyzer and requires execute permission. Return the process exit code, "
+        "standard output, and standard error."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": False,
+    },
+    "strict": True,
+}
+
+
+RUN_DART_FORMAT_TOOL = {
+    "type": "function",
+    "name": "run_dart_format",
+    "description": (
+        "Run `dart format .` in the fixed Door Opener Flutter project. This overwrites "
+        "Dart source files and requires write permission. Return the process exit code, "
+        "standard output, and standard error."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": False,
+    },
+    "strict": True,
+}
+
+
 # Keep authorization metadata separate from the schemas sent to the model.
 TOOL_PERMISSIONS: dict[str, frozenset[ToolPermission]] = {
     READ_SOURCE_LINE_TOOL["name"]: frozenset({ToolPermission.READ}),
     READ_FILE_TOOL["name"]: frozenset({ToolPermission.READ}),
     LIST_FILES_TOOL["name"]: frozenset({ToolPermission.READ}),
     SEARCH_CODE_TOOL["name"]: frozenset({ToolPermission.READ}),
+    RUN_FLUTTER_TESTS_TOOL["name"]: frozenset({ToolPermission.EXECUTE}),
+    RUN_DART_ANALYZE_TOOL["name"]: frozenset({ToolPermission.EXECUTE}),
+    RUN_DART_FORMAT_TOOL["name"]: frozenset({ToolPermission.WRITE}),
 }
 
 
@@ -206,6 +292,87 @@ def read_source_line(source_text: str, line_number: int) -> str:
         )
 
     return f"{line_number}: {source_lines[line_number - 1]}"
+
+
+def run_flutter_tests(
+    project_directory: Path = FLUTTER_PROJECT_DIRECTORY,
+) -> FlutterTestResult:
+    """Run the fixed Flutter project's tests without accepting arbitrary commands."""
+    project_path = project_directory.resolve()
+    if not (project_path / "pubspec.yaml").is_file():
+        raise ValueError(f"Flutter project does not contain pubspec.yaml: {project_path}")
+
+    try:
+        completed_process = subprocess.run(
+            ["flutter", "test"],
+            cwd=project_path,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise TimeoutError("flutter test exceeded the 300-second time limit.") from error
+
+    return FlutterTestResult(
+        exit_code=completed_process.returncode,
+        stdout=completed_process.stdout,
+        stderr=completed_process.stderr,
+    )
+
+
+def run_dart_analyze(
+    project_directory: Path = FLUTTER_PROJECT_DIRECTORY,
+) -> DartAnalyzeResult:
+    """Run the Dart analyzer without accepting arbitrary commands or paths."""
+    project_path = project_directory.resolve()
+    if not (project_path / "pubspec.yaml").is_file():
+        raise ValueError(f"Flutter project does not contain pubspec.yaml: {project_path}")
+
+    try:
+        completed_process = subprocess.run(
+            ["dart", "analyze"],
+            cwd=project_path,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise TimeoutError("dart analyze exceeded the 300-second time limit.") from error
+
+    return DartAnalyzeResult(
+        exit_code=completed_process.returncode,
+        stdout=completed_process.stdout,
+        stderr=completed_process.stderr,
+    )
+
+
+def run_dart_format(
+    project_directory: Path = FLUTTER_PROJECT_DIRECTORY,
+) -> DartFormatResult:
+    """Format fixed-project Dart source without accepting arbitrary commands or paths."""
+    project_path = project_directory.resolve()
+    if not (project_path / "pubspec.yaml").is_file():
+        raise ValueError(f"Flutter project does not contain pubspec.yaml: {project_path}")
+
+    try:
+        completed_process = subprocess.run(
+            ["dart", "format", "."],
+            cwd=project_path,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise TimeoutError("dart format exceeded the 300-second time limit.") from error
+
+    return DartFormatResult(
+        exit_code=completed_process.returncode,
+        stdout=completed_process.stdout,
+        stderr=completed_process.stderr,
+    )
 
 
 def _resolved_approved_directories(

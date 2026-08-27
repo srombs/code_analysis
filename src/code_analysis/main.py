@@ -13,12 +13,18 @@ from code_analysis.schemas import AnalysisResult, Finding  # noqa: F401
 from code_analysis.tool_schemas import (
     LIST_FILES_TOOL,
     READ_FILE_TOOL,
+    RUN_DART_ANALYZE_TOOL,
+    RUN_DART_FORMAT_TOOL,
+    RUN_FLUTTER_TESTS_TOOL,
     SEARCH_CODE_TOOL,
     FileState,
     ToolPermission,
     get_tool_permissions,
     list_files,
     read_file,
+    run_dart_analyze,
+    run_dart_format,
+    run_flutter_tests,
     search_code,
 )
 
@@ -47,6 +53,14 @@ class PermissionPolicy:
 
 
 DEFAULT_PERMISSION_POLICY = PermissionPolicy(frozenset({ToolPermission.READ}))
+ALL_TOOLS = [
+    READ_FILE_TOOL,
+    LIST_FILES_TOOL,
+    SEARCH_CODE_TOOL,
+    RUN_FLUTTER_TESTS_TOOL,
+    RUN_DART_ANALYZE_TOOL,
+    RUN_DART_FORMAT_TOOL,
+]
 
 
 def permission_policy_from_cli_values(
@@ -63,6 +77,11 @@ def format_permission_policy(permission_policy: PermissionPolicy) -> str:
     """Format the active permissions for the terminal."""
     permissions = ", ".join(sorted(permission_policy.allowed_permissions)) or "none"
     return f"Allowed permissions: {permissions}"
+
+
+def tools_allowed_by(permission_policy: PermissionPolicy) -> list[dict[str, object]]:
+    """Return only tool schemas that the active policy allows the app to execute."""
+    return [tool for tool in ALL_TOOLS if permission_policy.allows(tool["name"])]
 
 
 def read_text_file(file_path: str) -> str:
@@ -178,6 +197,33 @@ def execute_file_tool_calls(
                     f"(returned {len(search_result.matches)})"
                 )
                 print(f"Tool output:\n{json.dumps(asdict(search_result), indent=2)}")
+            elif output_item.name == RUN_FLUTTER_TESTS_TOOL["name"]:
+                if not isinstance(arguments, dict) or arguments:
+                    raise ValueError("run_flutter_tests does not accept arguments")
+
+                print("Tool call: run_flutter_tests()")
+                test_result = run_flutter_tests()
+                output = json.dumps(asdict(test_result))
+                print(f"Tool result: flutter test exited with code {test_result.exit_code}")
+                print(f"Tool output:\n{json.dumps(asdict(test_result), indent=2)}")
+            elif output_item.name == RUN_DART_ANALYZE_TOOL["name"]:
+                if not isinstance(arguments, dict) or arguments:
+                    raise ValueError("run_dart_analyze does not accept arguments")
+
+                print("Tool call: run_dart_analyze()")
+                analyze_result = run_dart_analyze()
+                output = json.dumps(asdict(analyze_result))
+                print(f"Tool result: dart analyze exited with code {analyze_result.exit_code}")
+                print(f"Tool output:\n{json.dumps(asdict(analyze_result), indent=2)}")
+            elif output_item.name == RUN_DART_FORMAT_TOOL["name"]:
+                if not isinstance(arguments, dict) or arguments:
+                    raise ValueError("run_dart_format does not accept arguments")
+
+                print("Tool call: run_dart_format()")
+                format_result = run_dart_format()
+                output = json.dumps(asdict(format_result))
+                print(f"Tool result: dart format exited with code {format_result.exit_code}")
+                print(f"Tool output:\n{json.dumps(asdict(format_result), indent=2)}")
             else:
                 raise ValueError(f"unsupported tool: {output_item.name}")
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
@@ -206,7 +252,7 @@ def request_analysis_with_tools(
         "model": MODEL,
         "instructions": AGENT_INSTRUCTIONS,
         "text_format": AnalysisResult,
-        "tools": [READ_FILE_TOOL, LIST_FILES_TOOL, SEARCH_CODE_TOOL],
+        "tools": tools_allowed_by(permission_policy),
         "tool_choice": "auto",
     }
     request_options["input"] = number_source_lines(text) if text else instructions
@@ -224,7 +270,7 @@ def request_analysis_with_tools(
             input=tool_outputs,
             previous_response_id=response.id,
             text_format=AnalysisResult,
-            tools=[READ_FILE_TOOL, LIST_FILES_TOOL, SEARCH_CODE_TOOL],
+            tools=tools_allowed_by(permission_policy),
             tool_choice="auto",
         )
 

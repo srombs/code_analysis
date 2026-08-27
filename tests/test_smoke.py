@@ -5,17 +5,24 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from code_analysis import main
+from code_analysis import main, tool_schemas
 from code_analysis.schemas import AnalysisResult, Finding
 from code_analysis.tool_schemas import (
     APPROVED_DIRECTORIES,
+    FLUTTER_PROJECT_DIRECTORY,
     LIST_FILES_TOOL,
     MAX_FILE_SIZE_BYTES,
     READ_FILE_TOOL,
     READ_SOURCE_LINE_TOOL,
+    RUN_DART_ANALYZE_TOOL,
+    RUN_DART_FORMAT_TOOL,
+    RUN_FLUTTER_TESTS_TOOL,
     SEARCH_CODE_MAX_RESULTS,
     SEARCH_CODE_TOOL,
+    DartAnalyzeResult,
+    DartFormatResult,
     FileState,
+    FlutterTestResult,
     SearchCodeResult,
     SearchResult,
     ToolPermission,
@@ -23,6 +30,9 @@ from code_analysis.tool_schemas import (
     list_files,
     read_file,
     read_source_line,
+    run_dart_analyze,
+    run_dart_format,
+    run_flutter_tests,
     search_code,
 )
 
@@ -74,6 +84,42 @@ def test_search_code_tool_schema_requires_a_query() -> None:
     assert SEARCH_CODE_TOOL["parameters"]["properties"]["query"]["type"] == "string"
 
 
+def test_run_flutter_tests_tool_schema_has_no_arguments() -> None:
+    assert RUN_FLUTTER_TESTS_TOOL["type"] == "function"
+    assert RUN_FLUTTER_TESTS_TOOL["name"] == "run_flutter_tests"
+    assert RUN_FLUTTER_TESTS_TOOL["strict"] is True
+    assert RUN_FLUTTER_TESTS_TOOL["parameters"] == {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": False,
+    }
+
+
+def test_run_dart_analyze_tool_schema_has_no_arguments() -> None:
+    assert RUN_DART_ANALYZE_TOOL["type"] == "function"
+    assert RUN_DART_ANALYZE_TOOL["name"] == "run_dart_analyze"
+    assert RUN_DART_ANALYZE_TOOL["strict"] is True
+    assert RUN_DART_ANALYZE_TOOL["parameters"] == {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": False,
+    }
+
+
+def test_run_dart_format_tool_schema_has_no_arguments() -> None:
+    assert RUN_DART_FORMAT_TOOL["type"] == "function"
+    assert RUN_DART_FORMAT_TOOL["name"] == "run_dart_format"
+    assert RUN_DART_FORMAT_TOOL["strict"] is True
+    assert RUN_DART_FORMAT_TOOL["parameters"] == {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": False,
+    }
+
+
 def test_tool_permissions_describe_the_current_read_only_tools() -> None:
     assert set(ToolPermission) == {
         ToolPermission.READ,
@@ -84,6 +130,13 @@ def test_tool_permissions_describe_the_current_read_only_tools() -> None:
     assert get_tool_permissions(READ_FILE_TOOL["name"]) == frozenset({ToolPermission.READ})
     assert get_tool_permissions(LIST_FILES_TOOL["name"]) == frozenset({ToolPermission.READ})
     assert get_tool_permissions(SEARCH_CODE_TOOL["name"]) == frozenset({ToolPermission.READ})
+    assert get_tool_permissions(RUN_FLUTTER_TESTS_TOOL["name"]) == frozenset(
+        {ToolPermission.EXECUTE}
+    )
+    assert get_tool_permissions(RUN_DART_ANALYZE_TOOL["name"]) == frozenset(
+        {ToolPermission.EXECUTE}
+    )
+    assert get_tool_permissions(RUN_DART_FORMAT_TOOL["name"]) == frozenset({ToolPermission.WRITE})
     assert get_tool_permissions("unknown_tool") == frozenset()
 
 
@@ -126,6 +179,118 @@ def test_permission_policy_rejects_a_tool_without_its_required_permission() -> N
             ),
         }
     ]
+
+
+def test_execute_permission_exposes_the_execute_tools() -> None:
+    execute_policy = main.PermissionPolicy(frozenset({ToolPermission.EXECUTE}))
+
+    assert main.tools_allowed_by(execute_policy) == [
+        RUN_FLUTTER_TESTS_TOOL,
+        RUN_DART_ANALYZE_TOOL,
+    ]
+
+
+def test_write_permission_exposes_only_the_dart_formatter() -> None:
+    write_policy = main.PermissionPolicy(frozenset({ToolPermission.WRITE}))
+
+    assert main.tools_allowed_by(write_policy) == [RUN_DART_FORMAT_TOOL]
+
+
+def test_run_flutter_tests_uses_a_fixed_flutter_command(monkeypatch, tmp_path) -> None:
+    (tmp_path / "pubspec.yaml").write_text("name: test_project", encoding="utf-8")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return type(
+            "CompletedProcess", (), {"returncode": 0, "stdout": "All passed", "stderr": ""}
+        )()
+
+    monkeypatch.setattr(tool_schemas.subprocess, "run", fake_run)
+
+    assert run_flutter_tests(tmp_path) == FlutterTestResult(
+        exit_code=0,
+        stdout="All passed",
+        stderr="",
+    )
+    assert calls == [
+        (
+            ["flutter", "test"],
+            {
+                "cwd": tmp_path.resolve(),
+                "capture_output": True,
+                "text": True,
+                "check": False,
+                "timeout": 300,
+            },
+        )
+    ]
+
+
+def test_run_dart_analyze_uses_a_fixed_dart_command(monkeypatch, tmp_path) -> None:
+    (tmp_path / "pubspec.yaml").write_text("name: test_project", encoding="utf-8")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return type(
+            "CompletedProcess", (), {"returncode": 1, "stdout": "Issue found", "stderr": ""}
+        )()
+
+    monkeypatch.setattr(tool_schemas.subprocess, "run", fake_run)
+
+    assert run_dart_analyze(tmp_path) == DartAnalyzeResult(
+        exit_code=1,
+        stdout="Issue found",
+        stderr="",
+    )
+    assert calls == [
+        (
+            ["dart", "analyze"],
+            {
+                "cwd": tmp_path.resolve(),
+                "capture_output": True,
+                "text": True,
+                "check": False,
+                "timeout": 300,
+            },
+        )
+    ]
+
+
+def test_run_dart_format_uses_a_fixed_dart_command(monkeypatch, tmp_path) -> None:
+    (tmp_path / "pubspec.yaml").write_text("name: test_project", encoding="utf-8")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return type(
+            "CompletedProcess", (), {"returncode": 0, "stdout": "Formatted", "stderr": ""}
+        )()
+
+    monkeypatch.setattr(tool_schemas.subprocess, "run", fake_run)
+
+    assert run_dart_format(tmp_path) == DartFormatResult(
+        exit_code=0,
+        stdout="Formatted",
+        stderr="",
+    )
+    assert calls == [
+        (
+            ["dart", "format", "."],
+            {
+                "cwd": tmp_path.resolve(),
+                "capture_output": True,
+                "text": True,
+                "check": False,
+                "timeout": 300,
+            },
+        )
+    ]
+
+
+def test_flutter_test_project_directory_is_the_door_opener_root() -> None:
+    assert FLUTTER_PROJECT_DIRECTORY == Path("/Users/rombs/Documents/gits/door-opener")
 
 
 def test_search_result_represents_a_code_match() -> None:
