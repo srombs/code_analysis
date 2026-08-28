@@ -1,11 +1,33 @@
 """Schemas and implementations for custom code-analysis tools."""
 
+import os
 import subprocess
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
 SEARCH_CODE_MAX_RESULTS = 30
+SEARCH_FILE_EXTENSIONS = frozenset(
+    {
+        ".dart",
+        ".gradle",
+        ".h",
+        ".java",
+        ".json",
+        ".kt",
+        ".kts",
+        ".m",
+        ".mm",
+        ".plist",
+        ".podspec",
+        ".properties",
+        ".swift",
+        ".xcconfig",
+        ".xml",
+        ".yaml",
+        ".yml",
+    }
+)
 
 
 class ToolPermission(StrEnum):
@@ -52,6 +74,21 @@ class FileAccessPolicy:
         }
     )
     protected_directory_names: frozenset[str] = frozenset({".aws", ".git", ".hg", ".ssh", ".svn"})
+    ignored_directory_names: frozenset[str] = frozenset(
+        {
+            ".dart_tool",
+            ".gradle",
+            ".idea",
+            ".symlinks",
+            ".vscode",
+            "DerivedData",
+            "Pods",
+            "__pycache__",
+            "build",
+            "coverage",
+            "node_modules",
+        }
+    )
     max_file_size_bytes: int = 10 * 1024 * 1024
 
 
@@ -184,8 +221,10 @@ SEARCH_CODE_TOOL = {
     "type": "function",
     "name": "search_code",
     "description": (
-        "Search eligible text files under the application-provided project root for text. "
-        "Protected files, files over 10 MiB, and non-text files are skipped. Return an object "
+        "Search Dart and native mobile source/configuration files under the application-provided "
+        "project root for text. Protected files, ignored directories, and files over 10 MiB "
+        "are skipped. "
+        "Return an object "
         "with: matches (up to 30 results, each with a path, one-based line number, and "
         "line text); total_matches (the count before limiting); and truncated (whether "
         "additional matches were omitted)."
@@ -195,7 +234,10 @@ SEARCH_CODE_TOOL = {
         "properties": {
             "query": {
                 "type": "string",
-                "description": "The exact text to search for in repository text files.",
+                "description": (
+                    "Text to search for case-insensitively in Dart and native mobile "
+                    "source/configuration files."
+                ),
             }
         },
         "required": ["query"],
@@ -420,6 +462,18 @@ def _is_protected_path(path: Path, file_access_policy: FileAccessPolicy) -> bool
     )
 
 
+def _is_ignored_path(path: Path, file_access_policy: FileAccessPolicy) -> bool:
+    """Return whether a path belongs to an ignored repository directory."""
+    root_path = _resolved_root_path(file_access_policy)
+    try:
+        path_parts = path.resolve().relative_to(root_path).parts
+    except ValueError:
+        return False
+
+    ignored_names = {name.casefold() for name in file_access_policy.ignored_directory_names}
+    return any(part.casefold() in ignored_names for part in path_parts)
+
+
 def read_file(
     file_path: str,
     file_access_policy: FileAccessPolicy,
@@ -440,6 +494,8 @@ def read_file(
     )
     if _is_protected_path(requested_path, file_access_policy):
         raise ValueError("file_path identifies a protected file or directory.")
+    if _is_ignored_path(requested_path, file_access_policy):
+        raise ValueError("file_path identifies an ignored directory.")
     if not requested_path.is_file():
         raise ValueError(f"file_path does not identify a file: {file_path}")
     file_size_bytes = requested_path.stat().st_size
@@ -462,30 +518,43 @@ def search_code(
     if not query:
         raise ValueError("query must not be empty.")
 
+    normalized_query = query.casefold()
     root_path = _resolved_root_path(file_access_policy)
     results = []
     total_matches = 0
 
-    for source_path in sorted(root_path.rglob("*")):
-        if (
-            not source_path.is_file()
-            or _is_protected_path(source_path, file_access_policy)
-            or not source_path.resolve().is_relative_to(root_path)
-        ):
-            continue
-
-        result_path = _path_for_model(source_path, root_path)
-        try:
-            source_text = read_file(str(source_path.relative_to(root_path)), file_access_policy)
-        except (OSError, UnicodeDecodeError, ValueError):
-            continue
-        for line_number, line in enumerate(source_text.splitlines(), start=1):
-            if query not in line:
+    for directory, directory_names, file_names in os.walk(root_path):
+        directory_path = Path(directory)
+        directory_names[:] = [
+            name
+            for name in directory_names
+            if not _is_protected_path(directory_path / name, file_access_policy)
+            and not _is_ignored_path(directory_path / name, file_access_policy)
+        ]
+        for file_name in sorted(file_names):
+            source_path = directory_path / file_name
+            if (
+                source_path.suffix.casefold() not in SEARCH_FILE_EXTENSIONS
+                or _is_protected_path(source_path, file_access_policy)
+                or _is_ignored_path(source_path, file_access_policy)
+                or not source_path.resolve().is_relative_to(root_path)
+            ):
                 continue
 
-            total_matches += 1
-            if len(results) < SEARCH_CODE_MAX_RESULTS:
-                results.append(SearchResult(path=result_path, line_number=line_number, text=line))
+            result_path = _path_for_model(source_path, root_path)
+            try:
+                source_text = read_file(str(source_path.relative_to(root_path)), file_access_policy)
+            except (OSError, UnicodeDecodeError, ValueError):
+                continue
+            for line_number, line in enumerate(source_text.splitlines(), start=1):
+                if normalized_query not in line.casefold():
+                    continue
+
+                total_matches += 1
+                if len(results) < SEARCH_CODE_MAX_RESULTS:
+                    results.append(
+                        SearchResult(path=result_path, line_number=line_number, text=line)
+                    )
 
     return SearchCodeResult(
         matches=tuple(results),
@@ -512,7 +581,9 @@ def list_files(
 
     paths = []
     for path in sorted(requested_path.iterdir()):
-        if _is_protected_path(path, file_access_policy):
+        if _is_protected_path(path, file_access_policy) or _is_ignored_path(
+            path, file_access_policy
+        ):
             continue
 
         model_path = _path_for_model(path, _resolved_root_path(file_access_policy))

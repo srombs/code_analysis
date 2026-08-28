@@ -432,12 +432,13 @@ def test_search_code_returns_a_result_for_each_matching_line(tmp_path) -> None:
     widgets_directory = tmp_path / "widgets"
     widgets_directory.mkdir()
     (widgets_directory / "button.dart").write_text("find this too\n", encoding="utf-8")
-    (tmp_path / "included.txt").write_text("find this\n", encoding="utf-8")
+    (tmp_path / "included.swift").write_text("find this\n", encoding="utf-8")
+    (tmp_path / "excluded.txt").write_text("find this\n", encoding="utf-8")
 
     assert search_code("find this", file_access_policy_for(tmp_path)) == SearchCodeResult(
         matches=(
             SearchResult(path="example.dart", line_number=2, text="find this"),
-            SearchResult(path="included.txt", line_number=1, text="find this"),
+            SearchResult(path="included.swift", line_number=1, text="find this"),
             SearchResult(path="widgets/button.dart", line_number=1, text="find this too"),
         ),
         total_matches=3,
@@ -450,6 +451,38 @@ def test_search_code_rejects_an_empty_query(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="must not be empty"):
         search_code("", file_access_policy_for(tmp_path))
+
+
+def test_search_code_matches_case_insensitively(tmp_path) -> None:
+    (tmp_path / "example.swift").write_text("func ImportantFunction() {}\n", encoding="utf-8")
+
+    assert search_code("importantfunction", file_access_policy_for(tmp_path)) == SearchCodeResult(
+        matches=(
+            SearchResult(
+                path="example.swift",
+                line_number=1,
+                text="func ImportantFunction() {}",
+            ),
+        ),
+        total_matches=1,
+        truncated=False,
+    )
+
+
+def test_file_tools_skip_ignored_directories(tmp_path) -> None:
+    (tmp_path / "source.dart").write_text("target", encoding="utf-8")
+    ignored_directory = tmp_path / ".dart_tool"
+    ignored_directory.mkdir()
+    (ignored_directory / "generated.dart").write_text("target", encoding="utf-8")
+
+    assert list_files("", file_access_policy_for(tmp_path)) == "source.dart"
+    assert search_code("target", file_access_policy_for(tmp_path)) == SearchCodeResult(
+        matches=(SearchResult(path="source.dart", line_number=1, text="target"),),
+        total_matches=1,
+        truncated=False,
+    )
+    with pytest.raises(ValueError, match="ignored directory"):
+        read_file(".dart_tool/generated.dart", file_access_policy_for(tmp_path))
 
 
 def test_search_code_stops_after_thirty_matches(tmp_path) -> None:
