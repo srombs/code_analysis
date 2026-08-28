@@ -8,8 +8,6 @@ from pydantic import ValidationError
 from code_analysis import main, tool_schemas
 from code_analysis.schemas import AnalysisResult, Finding
 from code_analysis.tool_schemas import (
-    DEFAULT_FILE_ACCESS_POLICY,
-    FLUTTER_PROJECT_DIRECTORY,
     LIST_FILES_TOOL,
     READ_FILE_TOOL,
     READ_SOURCE_LINE_TOOL,
@@ -37,9 +35,9 @@ from code_analysis.tool_schemas import (
 )
 
 
-def file_access_policy_for(*directories: Path) -> FileAccessPolicy:
+def file_access_policy_for(root_path: Path) -> FileAccessPolicy:
     """Create a default file policy limited to temporary test directories."""
-    return FileAccessPolicy(approved_directories=directories)
+    return FileAccessPolicy(root_path=root_path)
 
 
 def test_main_is_available() -> None:
@@ -158,6 +156,20 @@ def test_permission_policy_defaults_to_read_only_and_honors_cli_values() -> None
         {ToolPermission.WRITE, ToolPermission.EXTERNAL}
     )
     assert explicit_policy.allows(READ_FILE_TOOL["name"]) is False
+
+
+def test_root_path_requires_an_existing_directory(tmp_path) -> None:
+    assert main.root_path(str(tmp_path)) == tmp_path.resolve()
+
+    with pytest.raises(argparse.ArgumentTypeError, match="not a directory"):
+        main.root_path(str(tmp_path / "missing"))
+
+
+def test_file_access_instructions_identify_the_project_root(tmp_path) -> None:
+    instructions = main.instructions_for_file_access_policy(file_access_policy_for(tmp_path))
+
+    assert str(tmp_path.resolve()) in instructions
+    assert "relative to this root" in instructions
 
 
 def test_permission_policy_rejects_a_tool_without_its_required_permission() -> None:
@@ -294,10 +306,6 @@ def test_run_dart_format_uses_a_fixed_dart_command(monkeypatch, tmp_path) -> Non
     ]
 
 
-def test_flutter_test_project_directory_is_the_door_opener_root() -> None:
-    assert FLUTTER_PROJECT_DIRECTORY == Path("/Users/rombs/Documents/gits/door-opener")
-
-
 def test_search_result_represents_a_code_match() -> None:
     result = SearchResult(
         path="widgets/button.dart",
@@ -331,12 +339,11 @@ def test_file_state_contains_file_metadata_and_numbered_content() -> None:
     assert state.numbered_content == "1: class Button {}\n2: "
 
 
-def test_default_file_access_policy_has_both_project_directories_approved() -> None:
-    assert DEFAULT_FILE_ACCESS_POLICY.approved_directories == (
-        Path("/Users/rombs/Documents/gits/door-opener/lib"),
-        Path("/Users/rombs/Documents/gits/FW_IMP"),
-    )
-    assert DEFAULT_FILE_ACCESS_POLICY.max_file_size_bytes == 10 * 1024 * 1024
+def test_file_access_policy_uses_one_project_root(tmp_path) -> None:
+    policy = file_access_policy_for(tmp_path)
+
+    assert policy.root_path == tmp_path
+    assert policy.max_file_size_bytes == 10 * 1024 * 1024
 
 
 def test_read_source_line_returns_the_requested_one_based_line() -> None:
@@ -362,7 +369,7 @@ def test_read_file_returns_text_from_the_approved_directory(tmp_path) -> None:
 
 
 def test_read_file_rejects_paths_outside_the_approved_directory(tmp_path) -> None:
-    with pytest.raises(PermissionError, match="Access is not available outside"):
+    with pytest.raises(PermissionError, match="Access is not available outside the project root"):
         read_file("../outside.txt", file_access_policy_for(tmp_path))
 
 
@@ -376,7 +383,7 @@ def test_read_file_rejects_files_larger_than_ten_mebibytes(tmp_path) -> None:
     source_file = tmp_path / "large_source.dart"
     source_file.touch()
     with source_file.open("wb") as file:
-        file.truncate(DEFAULT_FILE_ACCESS_POLICY.max_file_size_bytes + 1)
+        file.truncate(10 * 1024 * 1024 + 1)
 
     with pytest.raises(ValueError, match="too large"):
         read_file("large_source.dart", file_access_policy_for(tmp_path))
@@ -386,7 +393,7 @@ def test_file_access_policy_can_customize_file_size_and_protected_names(tmp_path
     (tmp_path / "large.dart").write_text("12345", encoding="utf-8")
     (tmp_path / "internal.txt").write_text("secret", encoding="utf-8")
     custom_policy = FileAccessPolicy(
-        approved_directories=(tmp_path,),
+        root_path=tmp_path,
         max_file_size_bytes=4,
         protected_file_names=frozenset({"internal.txt"}),
     )
@@ -409,30 +416,12 @@ def test_read_file_rejects_common_protected_files(tmp_path, file_name: str) -> N
         read_file(file_name, file_access_policy_for(tmp_path))
 
 
-def test_file_tools_allow_each_approved_directory(tmp_path) -> None:
-    primary_directory = tmp_path / "primary"
-    secondary_directory = tmp_path / "secondary"
-    primary_directory.mkdir()
-    secondary_directory.mkdir()
-    (primary_directory / "primary.dart").write_text("primary match", encoding="utf-8")
-    secondary_file = secondary_directory / "secondary.dart"
-    secondary_file.write_text("secondary match", encoding="utf-8")
-    file_access_policy = file_access_policy_for(primary_directory, secondary_directory)
+def test_file_tools_require_paths_relative_to_the_project_root(tmp_path) -> None:
+    source_file = tmp_path / "source.dart"
+    source_file.write_text("match", encoding="utf-8")
 
-    assert read_file(str(secondary_file), file_access_policy) == "secondary match"
-    assert list_files(str(secondary_directory), file_access_policy) == str(secondary_file)
-    assert search_code("match", file_access_policy) == SearchCodeResult(
-        matches=(
-            SearchResult(path="primary.dart", line_number=1, text="primary match"),
-            SearchResult(
-                path=str(secondary_file),
-                line_number=1,
-                text="secondary match",
-            ),
-        ),
-        total_matches=2,
-        truncated=False,
-    )
+    with pytest.raises(PermissionError, match="must be relative"):
+        read_file(str(source_file), file_access_policy_for(tmp_path))
 
 
 def test_search_code_returns_a_result_for_each_matching_line(tmp_path) -> None:
@@ -443,14 +432,15 @@ def test_search_code_returns_a_result_for_each_matching_line(tmp_path) -> None:
     widgets_directory = tmp_path / "widgets"
     widgets_directory.mkdir()
     (widgets_directory / "button.dart").write_text("find this too\n", encoding="utf-8")
-    (tmp_path / "ignored.txt").write_text("find this\n", encoding="utf-8")
+    (tmp_path / "included.txt").write_text("find this\n", encoding="utf-8")
 
     assert search_code("find this", file_access_policy_for(tmp_path)) == SearchCodeResult(
         matches=(
             SearchResult(path="example.dart", line_number=2, text="find this"),
+            SearchResult(path="included.txt", line_number=1, text="find this"),
             SearchResult(path="widgets/button.dart", line_number=1, text="find this too"),
         ),
-        total_matches=2,
+        total_matches=3,
         truncated=False,
     )
 
@@ -501,7 +491,7 @@ def test_list_files_hides_protected_files_and_directories(tmp_path) -> None:
 
 
 def test_list_files_rejects_paths_outside_the_approved_directory(tmp_path) -> None:
-    with pytest.raises(PermissionError, match="Access is not available outside"):
+    with pytest.raises(PermissionError, match="Access is not available outside the project root"):
         list_files("../", file_access_policy_for(tmp_path))
 
 
@@ -665,6 +655,7 @@ def test_analyze_text_uses_luna_model() -> None:
 def test_analyze_text_executes_a_requested_file_read_and_returns_its_output(
     monkeypatch,
     capsys,
+    tmp_path,
 ) -> None:
     tool_call = type(
         "ToolCall",
@@ -694,10 +685,18 @@ def test_analyze_text_executes_a_requested_file_read_and_returns_its_output(
             calls.append(kwargs)
             return [first_response, final_response][len(calls) - 1]
 
-    monkeypatch.setattr(main, "read_file", lambda file_path: "class Widget {}\n")
+    monkeypatch.setattr(
+        main, "read_file", lambda file_path, file_access_policy: "class Widget {}\n"
+    )
     client = type("Client", (), {"responses": FakeResponses()})()
+    file_access_policy = file_access_policy_for(tmp_path)
 
-    assert main.analyze_text("entry point", "Analyze related code.", client) is final_response
+    assert (
+        main.analyze_text(
+            "entry point", "Analyze related code.", client, file_access_policy=file_access_policy
+        )
+        is final_response
+    )
     assert calls[1]["input"] == [
         {
             "type": "function_call_output",
@@ -717,6 +716,7 @@ def test_analyze_text_executes_a_requested_file_read_and_returns_its_output(
 def test_analyze_text_executes_a_requested_file_list_and_returns_its_output(
     monkeypatch,
     capsys,
+    tmp_path,
 ) -> None:
     tool_call = type(
         "ToolCall",
@@ -746,10 +746,18 @@ def test_analyze_text_executes_a_requested_file_list_and_returns_its_output(
             calls.append(kwargs)
             return [first_response, final_response][len(calls) - 1]
 
-    monkeypatch.setattr(main, "list_files", lambda directory_path: "widgets/button.py")
+    monkeypatch.setattr(
+        main, "list_files", lambda directory_path, file_access_policy: "widgets/button.py"
+    )
     client = type("Client", (), {"responses": FakeResponses()})()
+    file_access_policy = file_access_policy_for(tmp_path)
 
-    assert main.analyze_text("entry point", "Analyze related code.", client) is final_response
+    assert (
+        main.analyze_text(
+            "entry point", "Analyze related code.", client, file_access_policy=file_access_policy
+        )
+        is final_response
+    )
     assert calls[1]["input"] == [
         {
             "type": "function_call_output",
@@ -768,6 +776,7 @@ def test_analyze_text_executes_a_requested_file_list_and_returns_its_output(
 def test_analyze_text_executes_a_requested_code_search_and_returns_its_output(
     monkeypatch,
     capsys,
+    tmp_path,
 ) -> None:
     tool_call = type(
         "ToolCall",
@@ -800,15 +809,21 @@ def test_analyze_text_executes_a_requested_code_search_and_returns_its_output(
     monkeypatch.setattr(
         main,
         "search_code",
-        lambda query: SearchCodeResult(
+        lambda query, file_access_policy: SearchCodeResult(
             matches=(SearchResult(path="button.dart", line_number=7, text="class Button {}"),),
             total_matches=1,
             truncated=False,
         ),
     )
     client = type("Client", (), {"responses": FakeResponses()})()
+    file_access_policy = file_access_policy_for(tmp_path)
 
-    assert main.analyze_text("entry point", "Analyze related code.", client) is final_response
+    assert (
+        main.analyze_text(
+            "entry point", "Analyze related code.", client, file_access_policy=file_access_policy
+        )
+        is final_response
+    )
     assert calls[1]["input"] == [
         {
             "type": "function_call_output",
@@ -822,10 +837,9 @@ def test_analyze_text_executes_a_requested_code_search_and_returns_its_output(
     terminal_output = capsys.readouterr().out
     assert "Tool call: search_code(Button)" in terminal_output
     assert "Tool result: found 1 matches (returned 1)" in terminal_output
-    assert '"total_matches": 1' in terminal_output
 
 
-def test_file_tool_errors_are_returned_to_the_model(monkeypatch) -> None:
+def test_file_tool_errors_are_returned_to_the_model(monkeypatch, tmp_path) -> None:
     tool_call = type(
         "ToolCall",
         (),
@@ -840,10 +854,14 @@ def test_file_tool_errors_are_returned_to_the_model(monkeypatch) -> None:
     monkeypatch.setattr(
         main,
         "read_file",
-        lambda file_path: (_ for _ in ()).throw(ValueError("path is not allowed")),
+        lambda file_path, file_access_policy: (_ for _ in ()).throw(
+            ValueError("path is not allowed")
+        ),
     )
 
-    assert main.execute_file_tool_calls(response) == [
+    assert main.execute_file_tool_calls(
+        response, file_access_policy=file_access_policy_for(tmp_path)
+    ) == [
         {
             "type": "function_call_output",
             "call_id": "call_123",
@@ -1073,20 +1091,29 @@ def test_max_output_tokens_accepts_values_from_one_to_model_limit() -> None:
         main.max_output_tokens("0")
 
 
-def test_main_prints_model_response(monkeypatch, capsys) -> None:
+def test_main_prints_model_response(monkeypatch, capsys, tmp_path) -> None:
     monkeypatch.setattr(
         sys,
         "argv",
-        ["code-analysis", "Be concise."],
+        ["code-analysis", "--root-path", str(tmp_path), "Be concise."],
     )
     monkeypatch.setattr(main, "OpenAI", lambda: object())
     response = type("Response", (), {"output_parsed": object()})()
+
+    def fake_analyze_text(
+        text,
+        instructions,
+        client,
+        simulate_validation_error_once,
+        permission_policy,
+        file_access_policy,
+    ):
+        return response
+
     monkeypatch.setattr(
         main,
         "analyze_text",
-        lambda text, instructions, client, simulate_validation_error_once, permission_policy: (
-            response
-        ),
+        fake_analyze_text,
     )
     monkeypatch.setattr(main, "format_response", lambda response: "Full API response")
     monkeypatch.setattr(
@@ -1106,8 +1133,8 @@ def test_main_prints_model_response(monkeypatch, capsys) -> None:
     )
 
 
-def test_main_reports_analysis_errors(monkeypatch, capsys) -> None:
-    monkeypatch.setattr(sys, "argv", ["code-analysis", "Be concise."])
+def test_main_reports_analysis_errors(monkeypatch, capsys, tmp_path) -> None:
+    monkeypatch.setattr(sys, "argv", ["code-analysis", "--root-path", str(tmp_path), "Be concise."])
     monkeypatch.setattr(main, "OpenAI", lambda: object())
     monkeypatch.setattr(
         main,

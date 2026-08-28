@@ -17,6 +17,7 @@ from code_analysis.tool_schemas import (
     RUN_DART_FORMAT_TOOL,
     RUN_FLUTTER_TESTS_TOOL,
     SEARCH_CODE_TOOL,
+    FileAccessPolicy,
     FileState,
     ToolPermission,
     get_tool_permissions,
@@ -29,7 +30,21 @@ from code_analysis.tool_schemas import (
 )
 
 MODEL = "gpt-5.6-luna"
-AGENT_INSTRUCTIONS = "You are a code-analysis agent. Do not make claims about implementation unless those claims are supported by files you have inspected using the available tools. Return a structured analysis result. "
+AGENT_INSTRUCTIONS = """You are a software repository exploration agent.
+
+Your job is to answer questions about the supplied repository using the available tools.
+
+Rules:
+
+- Inspect repository code before making claims.
+- Do not guess about implementations you have not inspected.
+- Use search_code when locating symbols or concepts.
+- Use list_files when you need to understand directory structure.
+- Use read_file when you need implementation context.
+- Prefer targeted exploration over reading large numbers of files.
+- Reference file paths and line numbers in your final answer.
+- You have a limited tool-call budget.
+- Stop exploring when you have enough evidence to answer."""
 MAX_VALIDATION_RETRIES = 2
 MAX_TOOL_CALL_ROUNDS = 15
 INPUT_TOKEN_COST_PER_MILLION = 0.20
@@ -79,6 +94,26 @@ def format_permission_policy(permission_policy: PermissionPolicy) -> str:
     return f"Allowed permissions: {permissions}"
 
 
+def root_path(value: str) -> Path:
+    """Parse an existing project root supplied by the CLI user."""
+    path = Path(value).resolve()
+    if not path.is_dir():
+        raise argparse.ArgumentTypeError(f"root path is not a directory: {value}")
+    return path
+
+
+def instructions_for_file_access_policy(file_access_policy: FileAccessPolicy | None) -> str:
+    """Tell the model the app-controlled root used by its filesystem tools."""
+    if file_access_policy is None:
+        return AGENT_INSTRUCTIONS
+
+    root = file_access_policy.root_path.resolve()
+    return (
+        f"{AGENT_INSTRUCTIONS} The approved project root is {root}. "
+        "Use only paths relative to this root when calling filesystem tools."
+    )
+
+
 def tools_allowed_by(permission_policy: PermissionPolicy) -> list[dict[str, object]]:
     """Return only tool schemas that the active policy allows the app to execute."""
     return [tool for tool in ALL_TOOLS if permission_policy.allows(tool["name"])]
@@ -99,20 +134,20 @@ def read_text_file_with_retry(file_path: str) -> str:
             file_path = input("Enter a valid file path: ").strip()
 
 
-# def temperature(value: str) -> float:
-#     """Parse a temperature value accepted by the Responses API."""
-#     parsed_value = float(value)
-#     if not 0 <= parsed_value <= 2:
-#         raise argparse.ArgumentTypeError("temperature must be between 0 and 2")
-#     return parsed_value
+def temperature(value: str) -> float:
+    """Parse a temperature value accepted by the Responses API."""
+    parsed_value = float(value)
+    if not 0 <= parsed_value <= 2:
+        raise argparse.ArgumentTypeError("temperature must be between 0 and 2")
+    return parsed_value
 
 
-# def max_output_tokens(value: str) -> int:
-#     """Parse an output-token limit accepted by the selected model."""
-#     parsed_value = int(value)
-#     if not 1 <= parsed_value <= 128_000:
-#         raise argparse.ArgumentTypeError("max output tokens must be between 1 and 128000")
-#     return parsed_value
+def max_output_tokens(value: str) -> int:
+    """Parse an output-token limit accepted by the selected model."""
+    parsed_value = int(value)
+    if not 1 <= parsed_value <= 128_000:
+        raise argparse.ArgumentTypeError("max output tokens must be between 1 and 128000")
+    return parsed_value
 
 
 def number_source_lines(text: str) -> str:
@@ -143,6 +178,7 @@ def validate_analysis_result_source_lines(
 def execute_file_tool_calls(
     response: object,
     permission_policy: PermissionPolicy = DEFAULT_PERMISSION_POLICY,
+    file_access_policy: FileAccessPolicy | None = None,
 ) -> list[dict[str, str]]:
     """Execute requested file tools and format their results for the API."""
     tool_outputs = []
@@ -160,13 +196,16 @@ def execute_file_tool_calls(
                     f"{required_permissions or 'unknown'}."
                 )
 
+            if file_access_policy is None:
+                raise ValueError("A file access policy is required to execute tools.")
+
             if output_item.name == READ_FILE_TOOL["name"]:
                 if not isinstance(arguments, dict) or set(arguments) != {"file_path"}:
                     raise ValueError("tool arguments must contain only file_path")
 
                 file_path = arguments["file_path"]
                 print(f"Tool call: read_file({file_path})")
-                source_text = read_file(file_path)
+                source_text = read_file(file_path, file_access_policy)
                 file_state = FileState(
                     file_path=file_path,
                     line_count=len(source_text.splitlines()),
@@ -180,7 +219,7 @@ def execute_file_tool_calls(
 
                 directory_path = arguments["directory_path"]
                 print(f"Tool call: list_files({directory_path})")
-                output = list_files(directory_path)
+                output = list_files(directory_path, file_access_policy)
                 print(f"Tool result: listed {len(output.splitlines())} files")
                 print(f"Tool output:\n{output or '(no files found)'}")
             elif output_item.name == SEARCH_CODE_TOOL["name"]:
@@ -189,7 +228,7 @@ def execute_file_tool_calls(
 
                 query = arguments["query"]
                 print(f"Tool call: search_code({query})")
-                search_result = search_code(query)
+                search_result = search_code(query, file_access_policy)
                 output = json.dumps(asdict(search_result))
                 print(
                     "Tool result: found "
@@ -202,7 +241,7 @@ def execute_file_tool_calls(
                     raise ValueError("run_flutter_tests does not accept arguments")
 
                 print("Tool call: run_flutter_tests()")
-                test_result = run_flutter_tests()
+                test_result = run_flutter_tests(file_access_policy.root_path)
                 output = json.dumps(asdict(test_result))
                 print(f"Tool result: flutter test exited with code {test_result.exit_code}")
                 print(f"Tool output:\n{json.dumps(asdict(test_result), indent=2)}")
@@ -211,7 +250,7 @@ def execute_file_tool_calls(
                     raise ValueError("run_dart_analyze does not accept arguments")
 
                 print("Tool call: run_dart_analyze()")
-                analyze_result = run_dart_analyze()
+                analyze_result = run_dart_analyze(file_access_policy.root_path)
                 output = json.dumps(asdict(analyze_result))
                 print(f"Tool result: dart analyze exited with code {analyze_result.exit_code}")
                 print(f"Tool output:\n{json.dumps(asdict(analyze_result), indent=2)}")
@@ -220,7 +259,7 @@ def execute_file_tool_calls(
                     raise ValueError("run_dart_format does not accept arguments")
 
                 print("Tool call: run_dart_format()")
-                format_result = run_dart_format()
+                format_result = run_dart_format(file_access_policy.root_path)
                 output = json.dumps(asdict(format_result))
                 print(f"Tool result: dart format exited with code {format_result.exit_code}")
                 print(f"Tool output:\n{json.dumps(asdict(format_result), indent=2)}")
@@ -246,11 +285,12 @@ def request_analysis_with_tools(
     instructions: str,
     client: OpenAI,
     permission_policy: PermissionPolicy = DEFAULT_PERMISSION_POLICY,
+    file_access_policy: FileAccessPolicy | None = None,
 ) -> object:
     """Request an analysis and service file-read calls until it is complete."""
     request_options = {
         "model": MODEL,
-        "instructions": AGENT_INSTRUCTIONS,
+        "instructions": instructions_for_file_access_policy(file_access_policy),
         "text_format": AnalysisResult,
         "tools": tools_allowed_by(permission_policy),
         "tool_choice": "auto",
@@ -260,13 +300,13 @@ def request_analysis_with_tools(
     response = client.responses.parse(**request_options)
 
     for tool_round in range(MAX_TOOL_CALL_ROUNDS):
-        tool_outputs = execute_file_tool_calls(response, permission_policy)
+        tool_outputs = execute_file_tool_calls(response, permission_policy, file_access_policy)
         if not tool_outputs:
             return response
 
         response = client.responses.parse(
             model=MODEL,
-            instructions=AGENT_INSTRUCTIONS,
+            instructions=instructions_for_file_access_policy(file_access_policy),
             input=tool_outputs,
             previous_response_id=response.id,
             text_format=AnalysisResult,
@@ -283,6 +323,7 @@ def analyze_text(
     client: OpenAI,
     simulate_validation_error_once: bool = False,
     permission_policy: PermissionPolicy = DEFAULT_PERMISSION_POLICY,
+    file_access_policy: FileAccessPolicy | None = None,
 ) -> object:
     """Send text for analysis and return a response containing an AnalysisResult."""
     numbered_source = number_source_lines(text)
@@ -292,7 +333,13 @@ def analyze_text(
             if simulate_validation_error_once and attempt == 0:
                 AnalysisResult.model_validate({})
 
-            response = request_analysis_with_tools(text, instructions, client, permission_policy)
+            response = request_analysis_with_tools(
+                text,
+                instructions,
+                client,
+                permission_policy,
+                file_access_policy,
+            )
         except ValidationError as error:
             validation_error = error
         except Exception as error:
@@ -394,6 +441,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Analyze source files with the available tools.")
     parser.add_argument("instructions", help="Instructions for the analysis")
     parser.add_argument(
+        "--root-path",
+        required=True,
+        type=root_path,
+        help="Project root that bounds all filesystem tools for this run",
+    )
+    parser.add_argument(
         "--simulate-validation-error-once",
         action="store_true",
         help="Testing only: force one validation error before calling the API",
@@ -410,6 +463,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     permission_policy = permission_policy_from_cli_values(args.allow_permission)
+    file_access_policy = FileAccessPolicy(root_path=args.root_path)
 
     try:
         client = OpenAI()
@@ -426,6 +480,7 @@ def main() -> None:
             client,
             simulate_validation_error_once=args.simulate_validation_error_once,
             permission_policy=permission_policy,
+            file_access_policy=file_access_policy,
         )
     except AnalysisError as error:
         parser.error(str(error))

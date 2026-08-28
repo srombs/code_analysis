@@ -5,8 +5,6 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
-FLUTTER_PROJECT_DIRECTORY = Path("/Users/rombs/Documents/gits/door-opener")
-SEARCH_FILE_EXTENSION = ".dart"
 SEARCH_CODE_MAX_RESULTS = 30
 
 
@@ -23,7 +21,7 @@ class ToolPermission(StrEnum):
 class FileAccessPolicy:
     """The filesystem boundaries enforced by every file-access tool."""
 
-    approved_directories: tuple[Path, ...]
+    root_path: Path
     protected_file_suffixes: frozenset[str] = frozenset(
         {
             ".cer",
@@ -55,14 +53,6 @@ class FileAccessPolicy:
     )
     protected_directory_names: frozenset[str] = frozenset({".aws", ".git", ".hg", ".ssh", ".svn"})
     max_file_size_bytes: int = 10 * 1024 * 1024
-
-
-DEFAULT_FILE_ACCESS_POLICY = FileAccessPolicy(
-    approved_directories=(
-        Path("/Users/rombs/Documents/gits/door-opener/lib"),
-        Path("/Users/rombs/Documents/gits/FW_IMP"),
-    )
-)
 
 
 @dataclass(frozen=True)
@@ -145,9 +135,8 @@ READ_FILE_TOOL = {
     "description": (
         "Read a UTF-8 text file from an approved project directory. Secret, credential, "
         "and version-control files are protected and cannot be read. Files larger than "
-        "10 MiB cannot be read. Relative "
-        "paths are rooted at /Users/rombs/Documents/gits/door-opener/lib. To read "
-        "FW_IMP, use an absolute path under /Users/rombs/Documents/gits/FW_IMP. "
+        "10 MiB cannot be read. Paths must be relative to the application-provided "
+        "project root. "
         "Return an object with file_path, line_count, and numbered_content."
     ),
     "parameters": {
@@ -169,10 +158,9 @@ LIST_FILES_TOOL = {
     "type": "function",
     "name": "list_files",
     "description": (
-        "List files and subdirectories inside an approved directory. Relative paths are "
-        "rooted at /Users/rombs/Documents/gits/door-opener/lib. To browse FW_IMP, "
-        "start with /Users/rombs/Documents/gits/FW_IMP. Returned directories end with "
-        "a slash and can be passed to this tool again."
+        "List files and subdirectories inside the application-provided project root. "
+        "Paths must be relative to that root. Returned directories end with a slash and "
+        "can be passed to this tool again."
     ),
     "parameters": {
         "type": "object",
@@ -180,8 +168,8 @@ LIST_FILES_TOOL = {
             "directory_path": {
                 "type": "string",
                 "description": (
-                    "A directory path within an approved directory. Use an empty string "
-                    "to list the Door Opener root."
+                    "A directory path relative to the approved project root. Use an empty "
+                    "string to list that root."
                 ),
             }
         },
@@ -196,7 +184,8 @@ SEARCH_CODE_TOOL = {
     "type": "function",
     "name": "search_code",
     "description": (
-        "Search Dart source files in every approved directory for text. Return an object "
+        "Search eligible text files under the application-provided project root for text. "
+        "Protected files, files over 10 MiB, and non-text files are skipped. Return an object "
         "with: matches (up to 30 results, each with a path, one-based line number, and "
         "line text); total_matches (the count before limiting); and truncated (whether "
         "additional matches were omitted)."
@@ -206,7 +195,7 @@ SEARCH_CODE_TOOL = {
         "properties": {
             "query": {
                 "type": "string",
-                "description": "The exact text to search for in Dart source files.",
+                "description": "The exact text to search for in repository text files.",
             }
         },
         "required": ["query"],
@@ -220,9 +209,9 @@ RUN_FLUTTER_TESTS_TOOL = {
     "type": "function",
     "name": "run_flutter_tests",
     "description": (
-        "Run the full Flutter test suite with `flutter test` in the fixed Door Opener "
-        "project. This executes project code and requires execute permission. Return the "
-        "process exit code, standard output, and standard error."
+        "Run the full Flutter test suite with `flutter test` in the application-provided "
+        "project root. This executes project code and requires execute permission. Return "
+        "the process exit code, standard output, and standard error."
     ),
     "parameters": {
         "type": "object",
@@ -238,7 +227,7 @@ RUN_DART_ANALYZE_TOOL = {
     "type": "function",
     "name": "run_dart_analyze",
     "description": (
-        "Run `dart analyze` in the fixed Door Opener Flutter project. This executes the "
+        "Run `dart analyze` in the application-provided project root. This executes the "
         "Dart analyzer and requires execute permission. Return the process exit code, "
         "standard output, and standard error."
     ),
@@ -256,7 +245,7 @@ RUN_DART_FORMAT_TOOL = {
     "type": "function",
     "name": "run_dart_format",
     "description": (
-        "Run `dart format .` in the fixed Door Opener Flutter project. This overwrites "
+        "Run `dart format .` in the application-provided project root. This overwrites "
         "Dart source files and requires write permission. Return the process exit code, "
         "standard output, and standard error."
     ),
@@ -306,7 +295,7 @@ def read_source_line(source_text: str, line_number: int) -> str:
 
 
 def run_flutter_tests(
-    project_directory: Path = FLUTTER_PROJECT_DIRECTORY,
+    project_directory: Path,
 ) -> FlutterTestResult:
     """Run the fixed Flutter project's tests without accepting arbitrary commands."""
     project_path = project_directory.resolve()
@@ -333,7 +322,7 @@ def run_flutter_tests(
 
 
 def run_dart_analyze(
-    project_directory: Path = FLUTTER_PROJECT_DIRECTORY,
+    project_directory: Path,
 ) -> DartAnalyzeResult:
     """Run the Dart analyzer without accepting arbitrary commands or paths."""
     project_path = project_directory.resolve()
@@ -360,7 +349,7 @@ def run_dart_analyze(
 
 
 def run_dart_format(
-    project_directory: Path = FLUTTER_PROJECT_DIRECTORY,
+    project_directory: Path,
 ) -> DartFormatResult:
     """Format fixed-project Dart source without accepting arbitrary commands or paths."""
     project_path = project_directory.resolve()
@@ -386,41 +375,36 @@ def run_dart_format(
     )
 
 
-def _resolved_approved_directories(
-    file_access_policy: FileAccessPolicy,
-) -> tuple[Path, ...]:
-    """Resolve the app-controlled directories allowed for file tools."""
-    if not file_access_policy.approved_directories:
-        raise ValueError("At least one approved directory is required.")
-
-    return tuple(directory.resolve() for directory in file_access_policy.approved_directories)
+def _resolved_root_path(file_access_policy: FileAccessPolicy) -> Path:
+    """Resolve the app-controlled project root used by every file tool."""
+    root_path = file_access_policy.root_path.resolve()
+    if not root_path.is_dir():
+        raise ValueError(f"Project root is not a directory: {root_path}")
+    return root_path
 
 
 def _resolve_approved_path(
     requested_path: str,
     file_access_policy: FileAccessPolicy,
     path_name: str,
-) -> tuple[Path, tuple[Path, ...]]:
-    """Resolve a requested path and ensure it belongs to an allowed directory."""
-    approved_paths = _resolved_approved_directories(file_access_policy)
+) -> Path:
+    """Resolve a relative path and ensure it remains inside the project root."""
+    root_path = _resolved_root_path(file_access_policy)
     path = Path(requested_path)
-    resolved_path = path.resolve() if path.is_absolute() else (approved_paths[0] / path).resolve()
+    if path.is_absolute():
+        raise PermissionError(f"{path_name} must be relative to the approved project root.")
 
-    if not any(resolved_path.is_relative_to(approved_path) for approved_path in approved_paths):
-        raise PermissionError(
-            f"Access is not available outside the approved directories: {path_name}."
-        )
+    resolved_path = (root_path / path).resolve()
 
-    return resolved_path, approved_paths
+    if not resolved_path.is_relative_to(root_path):
+        raise PermissionError(f"Access is not available outside the project root: {path_name}.")
+
+    return resolved_path
 
 
-def _path_for_model(path: Path, approved_directories: tuple[Path, ...]) -> str:
-    """Keep Door Opener paths relative; make other-root paths unambiguous."""
-    primary_directory = approved_directories[0]
-    if path.is_relative_to(primary_directory):
-        return str(path.relative_to(primary_directory))
-
-    return str(path)
+def _path_for_model(path: Path, root_path: Path) -> str:
+    """Return a project-relative path for a model-facing tool result."""
+    return str(path.relative_to(root_path))
 
 
 def _is_protected_path(path: Path, file_access_policy: FileAccessPolicy) -> bool:
@@ -438,7 +422,7 @@ def _is_protected_path(path: Path, file_access_policy: FileAccessPolicy) -> bool
 
 def read_file(
     file_path: str,
-    file_access_policy: FileAccessPolicy = DEFAULT_FILE_ACCESS_POLICY,
+    file_access_policy: FileAccessPolicy,
 ) -> str:
     """Read a UTF-8 text file only when it is inside an approved directory.
 
@@ -449,7 +433,7 @@ def read_file(
     if not isinstance(file_path, str):
         raise TypeError("file_path must be a string.")
 
-    requested_path, _ = _resolve_approved_path(
+    requested_path = _resolve_approved_path(
         file_path,
         file_access_policy,
         "file_path",
@@ -470,38 +454,38 @@ def read_file(
 
 def search_code(
     query: str,
-    file_access_policy: FileAccessPolicy = DEFAULT_FILE_ACCESS_POLICY,
+    file_access_policy: FileAccessPolicy,
 ) -> SearchCodeResult:
-    """Return up to 30 matches and metadata for all approved Dart files."""
+    """Return up to 30 matches and metadata for eligible project text files."""
     if not isinstance(query, str):
         raise TypeError("query must be a string.")
     if not query:
         raise ValueError("query must not be empty.")
 
-    approved_paths = _resolved_approved_directories(file_access_policy)
+    root_path = _resolved_root_path(file_access_policy)
     results = []
     total_matches = 0
 
-    for approved_path in approved_paths:
-        for source_path in sorted(approved_path.rglob(f"*{SEARCH_FILE_EXTENSION}")):
-            if (
-                not source_path.is_file()
-                or _is_protected_path(source_path, file_access_policy)
-                or not source_path.resolve().is_relative_to(approved_path)
-            ):
+    for source_path in sorted(root_path.rglob("*")):
+        if (
+            not source_path.is_file()
+            or _is_protected_path(source_path, file_access_policy)
+            or not source_path.resolve().is_relative_to(root_path)
+        ):
+            continue
+
+        result_path = _path_for_model(source_path, root_path)
+        try:
+            source_text = read_file(str(source_path.relative_to(root_path)), file_access_policy)
+        except (OSError, UnicodeDecodeError, ValueError):
+            continue
+        for line_number, line in enumerate(source_text.splitlines(), start=1):
+            if query not in line:
                 continue
 
-            result_path = _path_for_model(source_path, approved_paths)
-            source_text = read_file(str(source_path), file_access_policy)
-            for line_number, line in enumerate(source_text.splitlines(), start=1):
-                if query not in line:
-                    continue
-
-                total_matches += 1
-                if len(results) < SEARCH_CODE_MAX_RESULTS:
-                    results.append(
-                        SearchResult(path=result_path, line_number=line_number, text=line)
-                    )
+            total_matches += 1
+            if len(results) < SEARCH_CODE_MAX_RESULTS:
+                results.append(SearchResult(path=result_path, line_number=line_number, text=line))
 
     return SearchCodeResult(
         matches=tuple(results),
@@ -512,13 +496,13 @@ def search_code(
 
 def list_files(
     directory_path: str,
-    file_access_policy: FileAccessPolicy = DEFAULT_FILE_ACCESS_POLICY,
+    file_access_policy: FileAccessPolicy,
 ) -> str:
     """List direct files and directories inside an approved directory."""
     if not isinstance(directory_path, str):
         raise TypeError("directory_path must be a string.")
 
-    requested_path, approved_paths = _resolve_approved_path(
+    requested_path = _resolve_approved_path(
         directory_path,
         file_access_policy,
         "directory_path",
@@ -531,7 +515,7 @@ def list_files(
         if _is_protected_path(path, file_access_policy):
             continue
 
-        model_path = _path_for_model(path, approved_paths)
+        model_path = _path_for_model(path, _resolved_root_path(file_access_policy))
         if path.is_dir():
             paths.append(f"{model_path}/")
         elif path.is_file():
