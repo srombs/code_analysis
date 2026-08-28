@@ -5,44 +5,9 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
-APPROVED_DIRECTORIES = (
-    Path("/Users/rombs/Documents/gits/door-opener/lib"),
-    Path("/Users/rombs/Documents/gits/FW_IMP"),
-)
 FLUTTER_PROJECT_DIRECTORY = Path("/Users/rombs/Documents/gits/door-opener")
-PROTECTED_FILE_SUFFIXES = frozenset(
-    {
-        ".cer",
-        ".crt",
-        ".der",
-        ".jks",
-        ".kdbx",
-        ".key",
-        ".keystore",
-        ".mobileprovision",
-        ".p12",
-        ".pem",
-        ".pfx",
-        ".ppk",
-    }
-)
-PROTECTED_FILE_NAMES = frozenset(
-    {
-        ".ds_store",
-        ".env",
-        ".netrc",
-        ".npmrc",
-        ".pypirc",
-        "id_dsa",
-        "id_ecdsa",
-        "id_ed25519",
-        "id_rsa",
-    }
-)
-PROTECTED_DIRECTORY_NAMES = frozenset({".aws", ".git", ".hg", ".ssh", ".svn"})
 SEARCH_FILE_EXTENSION = ".dart"
 SEARCH_CODE_MAX_RESULTS = 30
-MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024
 
 
 class ToolPermission(StrEnum):
@@ -52,6 +17,52 @@ class ToolPermission(StrEnum):
     WRITE = "write"
     EXTERNAL = "external"
     EXECUTE = "execute"
+
+
+@dataclass(frozen=True)
+class FileAccessPolicy:
+    """The filesystem boundaries enforced by every file-access tool."""
+
+    approved_directories: tuple[Path, ...]
+    protected_file_suffixes: frozenset[str] = frozenset(
+        {
+            ".cer",
+            ".crt",
+            ".der",
+            ".jks",
+            ".kdbx",
+            ".key",
+            ".keystore",
+            ".mobileprovision",
+            ".p12",
+            ".pem",
+            ".pfx",
+            ".ppk",
+        }
+    )
+    protected_file_names: frozenset[str] = frozenset(
+        {
+            ".ds_store",
+            ".env",
+            ".netrc",
+            ".npmrc",
+            ".pypirc",
+            "id_dsa",
+            "id_ecdsa",
+            "id_ed25519",
+            "id_rsa",
+        }
+    )
+    protected_directory_names: frozenset[str] = frozenset({".aws", ".git", ".hg", ".ssh", ".svn"})
+    max_file_size_bytes: int = 10 * 1024 * 1024
+
+
+DEFAULT_FILE_ACCESS_POLICY = FileAccessPolicy(
+    approved_directories=(
+        Path("/Users/rombs/Documents/gits/door-opener/lib"),
+        Path("/Users/rombs/Documents/gits/FW_IMP"),
+    )
+)
 
 
 @dataclass(frozen=True)
@@ -376,22 +387,22 @@ def run_dart_format(
 
 
 def _resolved_approved_directories(
-    approved_directories: tuple[Path, ...],
+    file_access_policy: FileAccessPolicy,
 ) -> tuple[Path, ...]:
     """Resolve the app-controlled directories allowed for file tools."""
-    if not approved_directories:
+    if not file_access_policy.approved_directories:
         raise ValueError("At least one approved directory is required.")
 
-    return tuple(directory.resolve() for directory in approved_directories)
+    return tuple(directory.resolve() for directory in file_access_policy.approved_directories)
 
 
 def _resolve_approved_path(
     requested_path: str,
-    approved_directories: tuple[Path, ...],
+    file_access_policy: FileAccessPolicy,
     path_name: str,
 ) -> tuple[Path, tuple[Path, ...]]:
     """Resolve a requested path and ensure it belongs to an allowed directory."""
-    approved_paths = _resolved_approved_directories(approved_directories)
+    approved_paths = _resolved_approved_directories(file_access_policy)
     path = Path(requested_path)
     resolved_path = path.resolve() if path.is_absolute() else (approved_paths[0] / path).resolve()
 
@@ -412,26 +423,26 @@ def _path_for_model(path: Path, approved_directories: tuple[Path, ...]) -> str:
     return str(path)
 
 
-def _is_protected_path(path: Path) -> bool:
+def _is_protected_path(path: Path, file_access_policy: FileAccessPolicy) -> bool:
     """Return whether a path looks like a secret or version-control artifact."""
     normalized_name = path.name.casefold()
     normalized_parts = (part.casefold() for part in path.parts)
 
     return (
-        normalized_name in PROTECTED_FILE_NAMES
+        normalized_name in file_access_policy.protected_file_names
         or normalized_name.startswith(".env.")
-        or path.suffix.casefold() in PROTECTED_FILE_SUFFIXES
-        or any(part in PROTECTED_DIRECTORY_NAMES for part in normalized_parts)
+        or path.suffix.casefold() in file_access_policy.protected_file_suffixes
+        or any(part in file_access_policy.protected_directory_names for part in normalized_parts)
     )
 
 
 def read_file(
     file_path: str,
-    approved_directories: tuple[Path, ...] = APPROVED_DIRECTORIES,
+    file_access_policy: FileAccessPolicy = DEFAULT_FILE_ACCESS_POLICY,
 ) -> str:
     """Read a UTF-8 text file only when it is inside an approved directory.
 
-    ``file_path`` is the value requested by the model. ``approved_directories``
+    ``file_path`` is the value requested by the model. ``file_access_policy``
     comes from the app, never from the model, so the app keeps control over
     which files may be exposed.
     """
@@ -440,18 +451,18 @@ def read_file(
 
     requested_path, _ = _resolve_approved_path(
         file_path,
-        approved_directories,
+        file_access_policy,
         "file_path",
     )
-    if _is_protected_path(requested_path):
+    if _is_protected_path(requested_path, file_access_policy):
         raise ValueError("file_path identifies a protected file or directory.")
     if not requested_path.is_file():
         raise ValueError(f"file_path does not identify a file: {file_path}")
     file_size_bytes = requested_path.stat().st_size
-    if file_size_bytes > MAX_FILE_SIZE_BYTES:
+    if file_size_bytes > file_access_policy.max_file_size_bytes:
         raise ValueError(
             f"file_path is too large ({file_size_bytes} bytes); the maximum is "
-            f"{MAX_FILE_SIZE_BYTES} bytes."
+            f"{file_access_policy.max_file_size_bytes} bytes."
         )
 
     return requested_path.read_text(encoding="utf-8")
@@ -459,7 +470,7 @@ def read_file(
 
 def search_code(
     query: str,
-    approved_directories: tuple[Path, ...] = APPROVED_DIRECTORIES,
+    file_access_policy: FileAccessPolicy = DEFAULT_FILE_ACCESS_POLICY,
 ) -> SearchCodeResult:
     """Return up to 30 matches and metadata for all approved Dart files."""
     if not isinstance(query, str):
@@ -467,7 +478,7 @@ def search_code(
     if not query:
         raise ValueError("query must not be empty.")
 
-    approved_paths = _resolved_approved_directories(approved_directories)
+    approved_paths = _resolved_approved_directories(file_access_policy)
     results = []
     total_matches = 0
 
@@ -475,13 +486,13 @@ def search_code(
         for source_path in sorted(approved_path.rglob(f"*{SEARCH_FILE_EXTENSION}")):
             if (
                 not source_path.is_file()
-                or _is_protected_path(source_path)
+                or _is_protected_path(source_path, file_access_policy)
                 or not source_path.resolve().is_relative_to(approved_path)
             ):
                 continue
 
             result_path = _path_for_model(source_path, approved_paths)
-            source_text = read_file(str(source_path), approved_paths)
+            source_text = read_file(str(source_path), file_access_policy)
             for line_number, line in enumerate(source_text.splitlines(), start=1):
                 if query not in line:
                     continue
@@ -501,7 +512,7 @@ def search_code(
 
 def list_files(
     directory_path: str,
-    approved_directories: tuple[Path, ...] = APPROVED_DIRECTORIES,
+    file_access_policy: FileAccessPolicy = DEFAULT_FILE_ACCESS_POLICY,
 ) -> str:
     """List direct files and directories inside an approved directory."""
     if not isinstance(directory_path, str):
@@ -509,7 +520,7 @@ def list_files(
 
     requested_path, approved_paths = _resolve_approved_path(
         directory_path,
-        approved_directories,
+        file_access_policy,
         "directory_path",
     )
     if not requested_path.is_dir():
@@ -517,7 +528,7 @@ def list_files(
 
     paths = []
     for path in sorted(requested_path.iterdir()):
-        if _is_protected_path(path):
+        if _is_protected_path(path, file_access_policy):
             continue
 
         model_path = _path_for_model(path, approved_paths)

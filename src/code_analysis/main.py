@@ -196,7 +196,7 @@ def execute_file_tool_calls(
                     f"{search_result.total_matches} matches "
                     f"(returned {len(search_result.matches)})"
                 )
-                print(f"Tool output:\n{json.dumps(asdict(search_result), indent=2)}")
+                # print(f"Tool output:\n{json.dumps(asdict(search_result), indent=2)}")
             elif output_item.name == RUN_FLUTTER_TESTS_TOOL["name"]:
                 if not isinstance(arguments, dict) or arguments:
                     raise ValueError("run_flutter_tests does not accept arguments")

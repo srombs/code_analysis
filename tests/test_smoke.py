@@ -8,10 +8,9 @@ from pydantic import ValidationError
 from code_analysis import main, tool_schemas
 from code_analysis.schemas import AnalysisResult, Finding
 from code_analysis.tool_schemas import (
-    APPROVED_DIRECTORIES,
+    DEFAULT_FILE_ACCESS_POLICY,
     FLUTTER_PROJECT_DIRECTORY,
     LIST_FILES_TOOL,
-    MAX_FILE_SIZE_BYTES,
     READ_FILE_TOOL,
     READ_SOURCE_LINE_TOOL,
     RUN_DART_ANALYZE_TOOL,
@@ -21,6 +20,7 @@ from code_analysis.tool_schemas import (
     SEARCH_CODE_TOOL,
     DartAnalyzeResult,
     DartFormatResult,
+    FileAccessPolicy,
     FileState,
     FlutterTestResult,
     SearchCodeResult,
@@ -35,6 +35,11 @@ from code_analysis.tool_schemas import (
     run_flutter_tests,
     search_code,
 )
+
+
+def file_access_policy_for(*directories: Path) -> FileAccessPolicy:
+    """Create a default file policy limited to temporary test directories."""
+    return FileAccessPolicy(approved_directories=directories)
 
 
 def test_main_is_available() -> None:
@@ -326,11 +331,12 @@ def test_file_state_contains_file_metadata_and_numbered_content() -> None:
     assert state.numbered_content == "1: class Button {}\n2: "
 
 
-def test_file_tools_have_both_project_directories_approved() -> None:
-    assert APPROVED_DIRECTORIES == (
+def test_default_file_access_policy_has_both_project_directories_approved() -> None:
+    assert DEFAULT_FILE_ACCESS_POLICY.approved_directories == (
         Path("/Users/rombs/Documents/gits/door-opener/lib"),
         Path("/Users/rombs/Documents/gits/FW_IMP"),
     )
+    assert DEFAULT_FILE_ACCESS_POLICY.max_file_size_bytes == 10 * 1024 * 1024
 
 
 def test_read_source_line_returns_the_requested_one_based_line() -> None:
@@ -352,28 +358,44 @@ def test_read_file_returns_text_from_the_approved_directory(tmp_path) -> None:
     source_file = tmp_path / "example.dart"
     source_file.write_text("print('hello')\n", encoding="utf-8")
 
-    assert read_file("example.dart", (tmp_path,)) == "print('hello')\n"
+    assert read_file("example.dart", file_access_policy_for(tmp_path)) == "print('hello')\n"
 
 
 def test_read_file_rejects_paths_outside_the_approved_directory(tmp_path) -> None:
     with pytest.raises(PermissionError, match="Access is not available outside"):
-        read_file("../outside.txt", (tmp_path,))
+        read_file("../outside.txt", file_access_policy_for(tmp_path))
 
 
 def test_read_file_allows_non_dart_text_files(tmp_path) -> None:
     (tmp_path / "settings.json").write_text("{}", encoding="utf-8")
 
-    assert read_file("settings.json", (tmp_path,)) == "{}"
+    assert read_file("settings.json", file_access_policy_for(tmp_path)) == "{}"
 
 
 def test_read_file_rejects_files_larger_than_ten_mebibytes(tmp_path) -> None:
     source_file = tmp_path / "large_source.dart"
     source_file.touch()
     with source_file.open("wb") as file:
-        file.truncate(MAX_FILE_SIZE_BYTES + 1)
+        file.truncate(DEFAULT_FILE_ACCESS_POLICY.max_file_size_bytes + 1)
 
     with pytest.raises(ValueError, match="too large"):
-        read_file("large_source.dart", (tmp_path,))
+        read_file("large_source.dart", file_access_policy_for(tmp_path))
+
+
+def test_file_access_policy_can_customize_file_size_and_protected_names(tmp_path) -> None:
+    (tmp_path / "large.dart").write_text("12345", encoding="utf-8")
+    (tmp_path / "internal.txt").write_text("secret", encoding="utf-8")
+    custom_policy = FileAccessPolicy(
+        approved_directories=(tmp_path,),
+        max_file_size_bytes=4,
+        protected_file_names=frozenset({"internal.txt"}),
+    )
+
+    with pytest.raises(ValueError, match="too large"):
+        read_file("large.dart", custom_policy)
+    with pytest.raises(ValueError, match="protected"):
+        read_file("internal.txt", custom_policy)
+    assert list_files("", custom_policy) == "large.dart"
 
 
 @pytest.mark.parametrize(
@@ -384,7 +406,7 @@ def test_read_file_rejects_common_protected_files(tmp_path, file_name: str) -> N
     (tmp_path / file_name).write_text("secret", encoding="utf-8")
 
     with pytest.raises(ValueError, match="protected"):
-        read_file(file_name, (tmp_path,))
+        read_file(file_name, file_access_policy_for(tmp_path))
 
 
 def test_file_tools_allow_each_approved_directory(tmp_path) -> None:
@@ -395,11 +417,11 @@ def test_file_tools_allow_each_approved_directory(tmp_path) -> None:
     (primary_directory / "primary.dart").write_text("primary match", encoding="utf-8")
     secondary_file = secondary_directory / "secondary.dart"
     secondary_file.write_text("secondary match", encoding="utf-8")
-    approved_directories = (primary_directory, secondary_directory)
+    file_access_policy = file_access_policy_for(primary_directory, secondary_directory)
 
-    assert read_file(str(secondary_file), approved_directories) == "secondary match"
-    assert list_files(str(secondary_directory), approved_directories) == str(secondary_file)
-    assert search_code("match", approved_directories) == SearchCodeResult(
+    assert read_file(str(secondary_file), file_access_policy) == "secondary match"
+    assert list_files(str(secondary_directory), file_access_policy) == str(secondary_file)
+    assert search_code("match", file_access_policy) == SearchCodeResult(
         matches=(
             SearchResult(path="primary.dart", line_number=1, text="primary match"),
             SearchResult(
@@ -423,7 +445,7 @@ def test_search_code_returns_a_result_for_each_matching_line(tmp_path) -> None:
     (widgets_directory / "button.dart").write_text("find this too\n", encoding="utf-8")
     (tmp_path / "ignored.txt").write_text("find this\n", encoding="utf-8")
 
-    assert search_code("find this", (tmp_path,)) == SearchCodeResult(
+    assert search_code("find this", file_access_policy_for(tmp_path)) == SearchCodeResult(
         matches=(
             SearchResult(path="example.dart", line_number=2, text="find this"),
             SearchResult(path="widgets/button.dart", line_number=1, text="find this too"),
@@ -437,7 +459,7 @@ def test_search_code_rejects_an_empty_query(tmp_path) -> None:
     (tmp_path / "example.dart").write_text("anything", encoding="utf-8")
 
     with pytest.raises(ValueError, match="must not be empty"):
-        search_code("", (tmp_path,))
+        search_code("", file_access_policy_for(tmp_path))
 
 
 def test_search_code_stops_after_thirty_matches(tmp_path) -> None:
@@ -446,7 +468,7 @@ def test_search_code_stops_after_thirty_matches(tmp_path) -> None:
         encoding="utf-8",
     )
 
-    result = search_code("match", (tmp_path,))
+    result = search_code("match", file_access_policy_for(tmp_path))
 
     assert len(result.matches) == SEARCH_CODE_MAX_RESULTS
     assert result.matches[0].line_number == 1
@@ -462,8 +484,11 @@ def test_list_files_returns_sorted_paths_relative_to_the_approved_directory(tmp_
     (subdirectory / "button.py").write_text("", encoding="utf-8")
     (subdirectory / "input.py").write_text("", encoding="utf-8")
 
-    assert list_files("widgets", (tmp_path,)) == "widgets/button.py\nwidgets/input.py"
-    assert list_files("", (tmp_path,)) == "widgets/\nzebra.py"
+    assert (
+        list_files("widgets", file_access_policy_for(tmp_path))
+        == "widgets/button.py\nwidgets/input.py"
+    )
+    assert list_files("", file_access_policy_for(tmp_path)) == "widgets/\nzebra.py"
 
 
 def test_list_files_hides_protected_files_and_directories(tmp_path) -> None:
@@ -472,12 +497,12 @@ def test_list_files_hides_protected_files_and_directories(tmp_path) -> None:
     (tmp_path / "source.py").write_text("print('safe')", encoding="utf-8")
     (tmp_path / ".git").mkdir()
 
-    assert list_files("", (tmp_path,)) == "source.py"
+    assert list_files("", file_access_policy_for(tmp_path)) == "source.py"
 
 
 def test_list_files_rejects_paths_outside_the_approved_directory(tmp_path) -> None:
     with pytest.raises(PermissionError, match="Access is not available outside"):
-        list_files("../", (tmp_path,))
+        list_files("../", file_access_policy_for(tmp_path))
 
 
 def test_main_uses_the_schemas_module_models() -> None:
