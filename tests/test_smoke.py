@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from code_analysis import main, tool_schemas
 from code_analysis.schemas import AnalysisResult, Finding
 from code_analysis.tool_schemas import (
+    APPLY_PATCH_TOOL,
     LIST_FILES_TOOL,
     READ_FILE_TOOL,
     READ_SOURCE_LINE_TOOL,
@@ -21,9 +22,12 @@ from code_analysis.tool_schemas import (
     FileAccessPolicy,
     FileState,
     FlutterTestResult,
+    PatchRequest,
+    PatchResult,
     SearchCodeResult,
     SearchResult,
     ToolPermission,
+    apply_patch,
     get_tool_permissions,
     list_files,
     read_file,
@@ -123,6 +127,13 @@ def test_run_dart_format_tool_schema_has_no_arguments() -> None:
     }
 
 
+def test_apply_patch_tool_schema_requires_a_structured_patch_request() -> None:
+    assert APPLY_PATCH_TOOL["type"] == "function"
+    assert APPLY_PATCH_TOOL["name"] == "apply_patch"
+    assert APPLY_PATCH_TOOL["strict"] is True
+    assert APPLY_PATCH_TOOL["parameters"]["required"] == ["path", "old_text", "new_text"]
+
+
 def test_tool_permissions_describe_the_current_read_only_tools() -> None:
     assert set(ToolPermission) == {
         ToolPermission.READ,
@@ -140,6 +151,9 @@ def test_tool_permissions_describe_the_current_read_only_tools() -> None:
         {ToolPermission.EXECUTE}
     )
     assert get_tool_permissions(RUN_DART_FORMAT_TOOL["name"]) == frozenset({ToolPermission.WRITE})
+    assert get_tool_permissions(APPLY_PATCH_TOOL["name"]) == frozenset(
+        {ToolPermission.READ, ToolPermission.WRITE}
+    )
     assert get_tool_permissions("unknown_tool") == frozenset()
 
 
@@ -147,7 +161,8 @@ def test_permission_policy_defaults_to_read_only_and_honors_cli_values() -> None
     assert main.permission_policy_from_cli_values(None) == main.DEFAULT_PERMISSION_POLICY
     assert main.DEFAULT_PERMISSION_POLICY.allows(READ_FILE_TOOL["name"])
     assert (
-        main.format_permission_policy(main.DEFAULT_PERMISSION_POLICY) == "Allowed permissions: read"
+        main.format_permission_policy(main.DEFAULT_PERMISSION_POLICY)
+        == "Allowed permissions: read, write"
     )
 
     explicit_policy = main.permission_policy_from_cli_values(["write", "external"])
@@ -207,10 +222,196 @@ def test_execute_permission_exposes_the_execute_tools() -> None:
     ]
 
 
-def test_write_permission_exposes_only_the_dart_formatter() -> None:
+def test_write_permission_exposes_the_write_tools() -> None:
     write_policy = main.PermissionPolicy(frozenset({ToolPermission.WRITE}))
 
     assert main.tools_allowed_by(write_policy) == [RUN_DART_FORMAT_TOOL]
+
+
+def test_apply_patch_replaces_one_unique_match(tmp_path, capsys) -> None:
+    (tmp_path / "lib").mkdir()
+    (tmp_path / "lib" / "example.dart").write_text("before", encoding="utf-8")
+    tool_call = type(
+        "ToolCall",
+        (),
+        {
+            "type": "function_call",
+            "name": "apply_patch",
+            "arguments": (
+                '{"path": "lib/example.dart", "old_text": "before", "new_text": "after"}'
+            ),
+            "call_id": "call_patch",
+        },
+    )()
+    response = type("Response", (), {"output": [tool_call]})()
+    write_policy = main.PermissionPolicy(frozenset({ToolPermission.READ, ToolPermission.WRITE}))
+
+    assert main.execute_file_tool_calls(
+        response,
+        write_policy,
+        file_access_policy_for(tmp_path),
+        {"lib/example.dart"},
+    ) == [
+        {
+            "type": "function_call_output",
+            "call_id": "call_patch",
+            "output": (
+                '{"success": true, "path": "lib/example.dart", "replacements": 1, '
+                '"message": "Patch applied successfully."}'
+            ),
+        }
+    ]
+    assert capsys.readouterr().out == (
+        "Tool call: apply_patch(lib/example.dart)\n"
+        'Tool result: {"success": true, "path": "lib/example.dart", "replacements": 1, '
+        '"message": "Patch applied successfully."}\n'
+    )
+    assert (tmp_path / "lib" / "example.dart").read_text(encoding="utf-8") == "after"
+
+
+def test_apply_patch_rejects_ambiguous_old_text_matches(tmp_path, capsys) -> None:
+    (tmp_path / "lib").mkdir()
+    source_file = tmp_path / "lib" / "example.dart"
+    source_file.write_text("before\nbefore\n", encoding="utf-8")
+    tool_call = type(
+        "ToolCall",
+        (),
+        {
+            "type": "function_call",
+            "name": "apply_patch",
+            "arguments": (
+                '{"path": "lib/example.dart", "old_text": "before", "new_text": "after"}'
+            ),
+            "call_id": "call_patch",
+        },
+    )()
+    response = type("Response", (), {"output": [tool_call]})()
+    write_policy = main.PermissionPolicy(frozenset({ToolPermission.READ, ToolPermission.WRITE}))
+
+    assert main.execute_file_tool_calls(
+        response,
+        write_policy,
+        file_access_policy_for(tmp_path),
+        {"lib/example.dart"},
+    ) == [
+        {
+            "type": "function_call_output",
+            "call_id": "call_patch",
+            "output": (
+                '{"success": false, "path": "lib/example.dart", "replacements": 0, '
+                '"message": "old_text matched more than once in the requested file; '
+                'found 2 matches."}'
+            ),
+        }
+    ]
+    assert source_file.read_text(encoding="utf-8") == "before\nbefore\n"
+    assert capsys.readouterr().out == (
+        "Tool call: apply_patch(lib/example.dart)\n"
+        'Tool result: {"success": false, "path": "lib/example.dart", "replacements": 0, '
+        '"message": "old_text matched more than once in the requested file; '
+        'found 2 matches."}\n'
+    )
+
+
+def test_patch_request_represents_one_text_replacement() -> None:
+    request = PatchRequest(path="lib/example.dart", old_text="before", new_text="after")
+
+    assert request.path == "lib/example.dart"
+
+
+def test_apply_patch_returns_not_found_outcome(tmp_path) -> None:
+    (tmp_path / "example.dart").write_text("before", encoding="utf-8")
+
+    assert apply_patch(
+        PatchRequest(path="example.dart", old_text="missing", new_text="after"),
+        file_access_policy_for(tmp_path),
+        {"example.dart"},
+    ) == PatchResult(
+        success=False,
+        path="example.dart",
+        replacements=0,
+        message="old_text was not found in the requested file.",
+    )
+
+
+def test_apply_patch_returns_the_replacement_count(tmp_path) -> None:
+    (tmp_path / "example.dart").write_text("before", encoding="utf-8")
+
+    assert apply_patch(
+        PatchRequest(path="example.dart", old_text="before", new_text="after"),
+        file_access_policy_for(tmp_path),
+        {"example.dart"},
+    ) == PatchResult(
+        success=True,
+        path="example.dart",
+        replacements=1,
+        message="Patch applied successfully.",
+    )
+
+
+def test_apply_patch_requires_the_file_to_be_read_first(tmp_path) -> None:
+    source_file = tmp_path / "example.dart"
+    source_file.write_text("before", encoding="utf-8")
+
+    assert apply_patch(
+        PatchRequest(path="example.dart", old_text="before", new_text="after"),
+        file_access_policy_for(tmp_path),
+        set(),
+    ) == PatchResult(
+        success=False,
+        path="example.dart",
+        replacements=0,
+        message="The file must be read with read_file before applying a patch.",
+    )
+    assert source_file.read_text(encoding="utf-8") == "before"
+
+
+def test_read_file_allows_a_later_patch_for_the_same_file(tmp_path) -> None:
+    source_file = tmp_path / "example.dart"
+    source_file.write_text("before", encoding="utf-8")
+    read_call = type(
+        "ToolCall",
+        (),
+        {
+            "type": "function_call",
+            "name": "read_file",
+            "arguments": '{"file_path": "example.dart"}',
+            "call_id": "call_read",
+        },
+    )()
+    patch_call = type(
+        "ToolCall",
+        (),
+        {
+            "type": "function_call",
+            "name": "apply_patch",
+            "arguments": ('{"path": "example.dart", "old_text": "before", "new_text": "after"}'),
+            "call_id": "call_patch",
+        },
+    )()
+    response = type("Response", (), {"output": [read_call, patch_call]})()
+    read_write_policy = main.PermissionPolicy(
+        frozenset({ToolPermission.READ, ToolPermission.WRITE})
+    )
+
+    changed_file_paths = set()
+    tool_outputs = main.execute_file_tool_calls(
+        response,
+        read_write_policy,
+        file_access_policy_for(tmp_path),
+        changed_file_paths=changed_file_paths,
+    )
+
+    assert tool_outputs[1] == {
+        "type": "function_call_output",
+        "call_id": "call_patch",
+        "output": (
+            '{"success": true, "path": "example.dart", "replacements": 1, '
+            '"message": "Patch applied successfully."}'
+        ),
+    }
+    assert source_file.read_text(encoding="utf-8") == "after"
+    assert changed_file_paths == {"example.dart"}
 
 
 def test_run_flutter_tests_uses_a_fixed_flutter_command(monkeypatch, tmp_path) -> None:
@@ -229,6 +430,7 @@ def test_run_flutter_tests_uses_a_fixed_flutter_command(monkeypatch, tmp_path) -
         exit_code=0,
         stdout="All passed",
         stderr="",
+        success=True,
     )
     assert calls == [
         (
@@ -260,6 +462,8 @@ def test_run_dart_analyze_uses_a_fixed_dart_command(monkeypatch, tmp_path) -> No
         exit_code=1,
         stdout="Issue found",
         stderr="",
+        timed_out=False,
+        success=False,
     )
     assert calls == [
         (
@@ -273,6 +477,68 @@ def test_run_dart_analyze_uses_a_fixed_dart_command(monkeypatch, tmp_path) -> No
             },
         )
     ]
+
+
+def test_run_dart_analyze_returns_a_timeout_result(monkeypatch, tmp_path) -> None:
+    (tmp_path / "pubspec.yaml").write_text("name: test_project", encoding="utf-8")
+
+    def fake_run(command, **kwargs):
+        raise tool_schemas.subprocess.TimeoutExpired(
+            command,
+            kwargs["timeout"],
+            output=b"partial output",
+            stderr=b"partial error",
+        )
+
+    monkeypatch.setattr(tool_schemas.subprocess, "run", fake_run)
+
+    assert run_dart_analyze(tmp_path) == DartAnalyzeResult(
+        exit_code=None,
+        stdout="partial output",
+        stderr="partial error",
+        timed_out=True,
+        success=False,
+    )
+
+
+def test_run_flutter_tests_truncates_large_output(monkeypatch, tmp_path) -> None:
+    (tmp_path / "pubspec.yaml").write_text("name: test_project", encoding="utf-8")
+    stdout = "a" * 10_000 + "removed" + "b" * 10_000
+    stderr = "c" * 10_000 + "removed" + "d" * 10_000
+
+    def fake_run(command, **kwargs):
+        return type(
+            "CompletedProcess",
+            (),
+            {"returncode": 0, "stdout": stdout, "stderr": stderr},
+        )()
+
+    monkeypatch.setattr(tool_schemas.subprocess, "run", fake_run)
+
+    result = run_flutter_tests(tmp_path)
+
+    assert result.stdout == "a" * 10_000 + "b" * 10_000
+    assert result.stderr == "c" * 10_000 + "d" * 10_000
+
+
+def test_run_dart_analyze_truncates_large_output(monkeypatch, tmp_path) -> None:
+    (tmp_path / "pubspec.yaml").write_text("name: test_project", encoding="utf-8")
+    stdout = "a" * 10_000 + "removed" + "b" * 10_000
+    stderr = "c" * 10_000 + "removed" + "d" * 10_000
+
+    def fake_run(command, **kwargs):
+        return type(
+            "CompletedProcess",
+            (),
+            {"returncode": 0, "stdout": stdout, "stderr": stderr},
+        )()
+
+    monkeypatch.setattr(tool_schemas.subprocess, "run", fake_run)
+
+    result = run_dart_analyze(tmp_path)
+
+    assert result.stdout == "a" * 10_000 + "b" * 10_000
+    assert result.stderr == "c" * 10_000 + "d" * 10_000
 
 
 def test_run_dart_format_uses_a_fixed_dart_command(monkeypatch, tmp_path) -> None:
@@ -679,7 +945,13 @@ def test_analyze_text_uses_luna_model() -> None:
             "instructions": main.AGENT_INSTRUCTIONS,
             "input": "1: first line\n2: second line",
             "text_format": main.AnalysisResult,
-            "tools": [main.READ_FILE_TOOL, main.LIST_FILES_TOOL, main.SEARCH_CODE_TOOL],
+            "tools": [
+                main.READ_FILE_TOOL,
+                main.LIST_FILES_TOOL,
+                main.SEARCH_CODE_TOOL,
+                main.RUN_DART_FORMAT_TOOL,
+                main.APPLY_PATCH_TOOL,
+            ],
             "tool_choice": "auto",
         }
     ]
@@ -1110,6 +1382,13 @@ def test_format_analysis_metrics_handles_missing_usage() -> None:
     )
 
 
+def test_format_changed_files_reports_sorted_paths_or_no_changes() -> None:
+    assert main.format_changed_files({"lib/b.dart", "lib/a.dart"}) == (
+        "Changed Files\n  - lib/a.dart\n  - lib/b.dart"
+    )
+    assert main.format_changed_files(set()) == "Changed Files\n  No files changed."
+
+
 def test_temperature_accepts_values_from_zero_to_two() -> None:
     assert main.temperature("0.7") == 0.7
 
@@ -1140,6 +1419,7 @@ def test_main_prints_model_response(monkeypatch, capsys, tmp_path) -> None:
         simulate_validation_error_once,
         permission_policy,
         file_access_policy,
+        changed_file_paths,
     ):
         return response
 
@@ -1162,7 +1442,9 @@ def test_main_prints_model_response(monkeypatch, capsys, tmp_path) -> None:
     main.main()
 
     assert (
-        capsys.readouterr().out == "Allowed permissions: read\nFormatted analysis result\nMetrics\n"
+        capsys.readouterr().out
+        == "Allowed permissions: read, write\nFormatted analysis result\nMetrics\n"
+        "Changed Files\n  No files changed.\n"
     )
 
 

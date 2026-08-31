@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 from code_analysis.schemas import AnalysisResult, Finding  # noqa: F401
 from code_analysis.tool_schemas import (
+    APPLY_PATCH_TOOL,
     LIST_FILES_TOOL,
     READ_FILE_TOOL,
     RUN_DART_ANALYZE_TOOL,
@@ -19,7 +20,9 @@ from code_analysis.tool_schemas import (
     SEARCH_CODE_TOOL,
     FileAccessPolicy,
     FileState,
+    PatchRequest,
     ToolPermission,
+    apply_patch,
     get_tool_permissions,
     list_files,
     read_file,
@@ -30,7 +33,7 @@ from code_analysis.tool_schemas import (
 )
 
 MODEL = "gpt-5.6-luna"
-AGENT_INSTRUCTIONS = """You are a software repository exploration agent.
+AGENT_INSTRUCTIONS = """You are a software repository exploration, rea, write agent.
 
 Your job is to answer questions about the supplied repository using the available tools.
 
@@ -43,6 +46,10 @@ Rules:
 - Use read_file when you need implementation context.
 - Prefer targeted exploration over reading large numbers of files.
 - Reference file paths and line numbers in your final answer.
+- Before modifying a file, inspect the relevant current contents.
+- Do not guess the current contents of a file.
+- Use apply_patch only for small, targeted edits.
+- Do not overwrite entire files unless explicitly required.
 - You have a limited tool-call budget.
 - Stop exploring when you have enough evidence to answer."""
 MAX_VALIDATION_RETRIES = 2
@@ -67,7 +74,7 @@ class PermissionPolicy:
         return bool(required_permissions) and required_permissions <= self.allowed_permissions
 
 
-DEFAULT_PERMISSION_POLICY = PermissionPolicy(frozenset({ToolPermission.READ}))
+DEFAULT_PERMISSION_POLICY = PermissionPolicy(frozenset({ToolPermission.READ, ToolPermission.WRITE}))
 ALL_TOOLS = [
     READ_FILE_TOOL,
     LIST_FILES_TOOL,
@@ -75,6 +82,7 @@ ALL_TOOLS = [
     RUN_FLUTTER_TESTS_TOOL,
     RUN_DART_ANALYZE_TOOL,
     RUN_DART_FORMAT_TOOL,
+    APPLY_PATCH_TOOL,
 ]
 
 
@@ -179,9 +187,13 @@ def execute_file_tool_calls(
     response: object,
     permission_policy: PermissionPolicy = DEFAULT_PERMISSION_POLICY,
     file_access_policy: FileAccessPolicy | None = None,
+    read_file_paths: set[str] | None = None,
+    changed_file_paths: set[str] | None = None,
 ) -> list[dict[str, str]]:
     """Execute requested file tools and format their results for the API."""
     tool_outputs = []
+    read_file_paths = read_file_paths if read_file_paths is not None else set()
+    changed_file_paths = changed_file_paths if changed_file_paths is not None else set()
 
     for output_item in getattr(response, "output", []):
         if getattr(output_item, "type", None) != "function_call":
@@ -206,6 +218,7 @@ def execute_file_tool_calls(
                 file_path = arguments["file_path"]
                 print(f"Tool call: read_file({file_path})")
                 source_text = read_file(file_path, file_access_policy)
+                read_file_paths.add(file_path)
                 file_state = FileState(
                     file_path=file_path,
                     line_count=len(source_text.splitlines()),
@@ -252,7 +265,10 @@ def execute_file_tool_calls(
                 print("Tool call: run_dart_analyze()")
                 analyze_result = run_dart_analyze(file_access_policy.root_path)
                 output = json.dumps(asdict(analyze_result))
-                print(f"Tool result: dart analyze exited with code {analyze_result.exit_code}")
+                if analyze_result.timed_out:
+                    print("Tool result: dart analyze timed out")
+                else:
+                    print(f"Tool result: dart analyze exited with code {analyze_result.exit_code}")
                 print(f"Tool output:\n{json.dumps(asdict(analyze_result), indent=2)}")
             elif output_item.name == RUN_DART_FORMAT_TOOL["name"]:
                 if not isinstance(arguments, dict) or arguments:
@@ -263,6 +279,27 @@ def execute_file_tool_calls(
                 output = json.dumps(asdict(format_result))
                 print(f"Tool result: dart format exited with code {format_result.exit_code}")
                 print(f"Tool output:\n{json.dumps(asdict(format_result), indent=2)}")
+            elif output_item.name == APPLY_PATCH_TOOL["name"]:
+                if not isinstance(arguments, dict) or set(arguments) != {
+                    "path",
+                    "old_text",
+                    "new_text",
+                }:
+                    raise ValueError(
+                        "tool arguments must contain only path, old_text, and new_text"
+                    )
+
+                patch_request = PatchRequest(**arguments)
+                print(f"Tool call: apply_patch({patch_request.path})")
+                patch_result = apply_patch(
+                    patch_request,
+                    file_access_policy,
+                    read_file_paths,
+                )
+                if patch_result.success:
+                    changed_file_paths.add(patch_result.path)
+                output = json.dumps(asdict(patch_result))
+                print(f"Tool result: {output}")
             else:
                 raise ValueError(f"unsupported tool: {output_item.name}")
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
@@ -286,6 +323,7 @@ def request_analysis_with_tools(
     client: OpenAI,
     permission_policy: PermissionPolicy = DEFAULT_PERMISSION_POLICY,
     file_access_policy: FileAccessPolicy | None = None,
+    changed_file_paths: set[str] | None = None,
 ) -> object:
     """Request an analysis and service file-read calls until it is complete."""
     request_options = {
@@ -299,8 +337,16 @@ def request_analysis_with_tools(
 
     response = client.responses.parse(**request_options)
 
+    read_file_paths = set()
+    changed_file_paths = changed_file_paths if changed_file_paths is not None else set()
     for tool_round in range(MAX_TOOL_CALL_ROUNDS):
-        tool_outputs = execute_file_tool_calls(response, permission_policy, file_access_policy)
+        tool_outputs = execute_file_tool_calls(
+            response,
+            permission_policy,
+            file_access_policy,
+            read_file_paths,
+            changed_file_paths,
+        )
         if not tool_outputs:
             return response
 
@@ -324,10 +370,12 @@ def analyze_text(
     simulate_validation_error_once: bool = False,
     permission_policy: PermissionPolicy = DEFAULT_PERMISSION_POLICY,
     file_access_policy: FileAccessPolicy | None = None,
+    changed_file_paths: set[str] | None = None,
 ) -> object:
     """Send text for analysis and return a response containing an AnalysisResult."""
     numbered_source = number_source_lines(text)
 
+    changed_file_paths = changed_file_paths if changed_file_paths is not None else set()
     for attempt in range(MAX_VALIDATION_RETRIES + 1):
         try:
             if simulate_validation_error_once and attempt == 0:
@@ -339,6 +387,7 @@ def analyze_text(
                 client,
                 permission_policy,
                 file_access_policy,
+                changed_file_paths,
             )
         except ValidationError as error:
             validation_error = error
@@ -436,6 +485,16 @@ def format_analysis_metrics(response: object, elapsed_seconds: float) -> str:
     return "\n".join(lines)
 
 
+def format_changed_files(file_paths: set[str]) -> str:
+    """Format the project-relative files changed during one agent run."""
+    lines = ["Changed Files"]
+    if not file_paths:
+        lines.append("  No files changed.")
+    else:
+        lines.extend(f"  - {path}" for path in sorted(file_paths))
+    return "\n".join(lines)
+
+
 def main() -> None:
     """Analyze a text file supplied from the command line."""
     parser = argparse.ArgumentParser(description="Analyze source files with the available tools.")
@@ -471,6 +530,7 @@ def main() -> None:
         parser.error(f"could not initialize OpenAI client: {error}")
 
     analysis_started_at = time.perf_counter()
+    changed_file_paths = set()
     print(format_permission_policy(permission_policy))
 
     try:
@@ -481,6 +541,7 @@ def main() -> None:
             simulate_validation_error_once=args.simulate_validation_error_once,
             permission_policy=permission_policy,
             file_access_policy=file_access_policy,
+            changed_file_paths=changed_file_paths,
         )
     except AnalysisError as error:
         parser.error(str(error))
@@ -489,6 +550,7 @@ def main() -> None:
 
     print(format_analysis_result_object(response.output_parsed))
     print(format_analysis_metrics(response, analysis_elapsed_seconds))
+    print(format_changed_files(changed_file_paths))
     # print(format_token_usage(response))
 
 

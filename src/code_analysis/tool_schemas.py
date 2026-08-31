@@ -7,6 +7,8 @@ from enum import StrEnum
 from pathlib import Path
 
 SEARCH_CODE_MAX_RESULTS = 30
+MAX_TOOL_OUTPUT_CHARS = 20_000
+TOOL_OUTPUT_EDGE_CHARS = MAX_TOOL_OUTPUT_CHARS // 2
 SEARCH_FILE_EXTENSIONS = frozenset(
     {
         ".dart",
@@ -126,15 +128,18 @@ class FlutterTestResult:
     exit_code: int
     stdout: str
     stderr: str
+    success: bool
 
 
 @dataclass(frozen=True)
 class DartAnalyzeResult:
     """The outcome and terminal output from one Dart analyzer run."""
 
-    exit_code: int
+    exit_code: int | None
     stdout: str
     stderr: str
+    timed_out: bool
+    success: bool
 
 
 @dataclass(frozen=True)
@@ -144,6 +149,25 @@ class DartFormatResult:
     exit_code: int
     stdout: str
     stderr: str
+
+
+@dataclass(frozen=True)
+class PatchRequest:
+    """One model-proposed text replacement."""
+
+    path: str
+    old_text: str
+    new_text: str
+
+
+@dataclass(frozen=True)
+class PatchResult:
+    """The outcome of applying one unambiguous text replacement."""
+
+    success: bool
+    path: str
+    replacements: int
+    message: str
 
 
 READ_SOURCE_LINE_TOOL = {
@@ -253,7 +277,7 @@ RUN_FLUTTER_TESTS_TOOL = {
     "description": (
         "Run the full Flutter test suite with `flutter test` in the application-provided "
         "project root. This executes project code and requires execute permission. Return "
-        "the process exit code, standard output, and standard error."
+        "the process exit code, standard output, standard error, and success status."
     ),
     "parameters": {
         "type": "object",
@@ -271,7 +295,7 @@ RUN_DART_ANALYZE_TOOL = {
     "description": (
         "Run `dart analyze` in the application-provided project root. This executes the "
         "Dart analyzer and requires execute permission. Return the process exit code, "
-        "standard output, and standard error."
+        "standard output, standard error, timeout status, and success status."
     ),
     "parameters": {
         "type": "object",
@@ -301,6 +325,36 @@ RUN_DART_FORMAT_TOOL = {
 }
 
 
+APPLY_PATCH_TOOL = {
+    "type": "function",
+    "name": "apply_patch",
+    "description": (
+        "Propose replacing text in one file inside the application-provided project root. "
+        "This tool requires write permission. The old text must occur exactly once in the file."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "The project-relative path of the file to change.",
+            },
+            "old_text": {
+                "type": "string",
+                "description": "The exact existing text expected in that file.",
+            },
+            "new_text": {
+                "type": "string",
+                "description": "The replacement text to write in place of old_text.",
+            },
+        },
+        "required": ["path", "old_text", "new_text"],
+        "additionalProperties": False,
+    },
+    "strict": True,
+}
+
+
 # Keep authorization metadata separate from the schemas sent to the model.
 TOOL_PERMISSIONS: dict[str, frozenset[ToolPermission]] = {
     READ_SOURCE_LINE_TOOL["name"]: frozenset({ToolPermission.READ}),
@@ -310,6 +364,7 @@ TOOL_PERMISSIONS: dict[str, frozenset[ToolPermission]] = {
     RUN_FLUTTER_TESTS_TOOL["name"]: frozenset({ToolPermission.EXECUTE}),
     RUN_DART_ANALYZE_TOOL["name"]: frozenset({ToolPermission.EXECUTE}),
     RUN_DART_FORMAT_TOOL["name"]: frozenset({ToolPermission.WRITE}),
+    APPLY_PATCH_TOOL["name"]: frozenset({ToolPermission.READ, ToolPermission.WRITE}),
 }
 
 
@@ -358,8 +413,9 @@ def run_flutter_tests(
 
     return FlutterTestResult(
         exit_code=completed_process.returncode,
-        stdout=completed_process.stdout,
-        stderr=completed_process.stderr,
+        stdout=_truncate_tool_output(completed_process.stdout),
+        stderr=_truncate_tool_output(completed_process.stderr),
+        success=completed_process.returncode == 0,
     )
 
 
@@ -381,13 +437,37 @@ def run_dart_analyze(
             timeout=300,
         )
     except subprocess.TimeoutExpired as error:
-        raise TimeoutError("dart analyze exceeded the 300-second time limit.") from error
+        return DartAnalyzeResult(
+            exit_code=None,
+            stdout=_truncate_tool_output(_timeout_stream_to_text(error.stdout)),
+            stderr=_truncate_tool_output(_timeout_stream_to_text(error.stderr)),
+            timed_out=True,
+            success=False,
+        )
 
     return DartAnalyzeResult(
         exit_code=completed_process.returncode,
-        stdout=completed_process.stdout,
-        stderr=completed_process.stderr,
+        stdout=_truncate_tool_output(completed_process.stdout),
+        stderr=_truncate_tool_output(completed_process.stderr),
+        timed_out=False,
+        success=completed_process.returncode == 0,
     )
+
+
+def _timeout_stream_to_text(value: str | bytes | None) -> str:
+    """Normalize subprocess timeout output for a JSON-serializable tool result."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode(encoding="utf-8", errors="replace")
+    return value
+
+
+def _truncate_tool_output(text: str) -> str:
+    """Limit tool output while retaining its beginning and end for model context."""
+    if len(text) <= MAX_TOOL_OUTPUT_CHARS:
+        return text
+    return text[:TOOL_OUTPUT_EDGE_CHARS] + text[-TOOL_OUTPUT_EDGE_CHARS:]
 
 
 def run_dart_format(
@@ -506,6 +586,65 @@ def read_file(
         )
 
     return requested_path.read_text(encoding="utf-8")
+
+
+def apply_patch(
+    patch_request: PatchRequest,
+    file_access_policy: FileAccessPolicy,
+    read_file_paths: set[str],
+) -> PatchResult:
+    """Replace one unique text match in an approved UTF-8 project file."""
+    if not isinstance(patch_request.path, str):
+        raise TypeError("path must be a string.")
+    if not isinstance(patch_request.old_text, str):
+        raise TypeError("old_text must be a string.")
+    if not isinstance(patch_request.new_text, str):
+        raise TypeError("new_text must be a string.")
+    if not patch_request.old_text:
+        raise ValueError("old_text must not be empty.")
+    if patch_request.path not in read_file_paths:
+        return PatchResult(
+            success=False,
+            path=patch_request.path,
+            replacements=0,
+            message="The file must be read with read_file before applying a patch.",
+        )
+
+    source_text = read_file(patch_request.path, file_access_policy)
+    old_text_match_count = source_text.count(patch_request.old_text)
+    if old_text_match_count > 1:
+        return PatchResult(
+            success=False,
+            path=patch_request.path,
+            replacements=0,
+            message=(
+                "old_text matched more than once in the requested file; "
+                f"found {old_text_match_count} matches."
+            ),
+        )
+    if old_text_match_count == 0:
+        return PatchResult(
+            success=False,
+            path=patch_request.path,
+            replacements=0,
+            message="old_text was not found in the requested file.",
+        )
+
+    requested_path = _resolve_approved_path(
+        patch_request.path,
+        file_access_policy,
+        "path",
+    )
+    requested_path.write_text(
+        source_text.replace(patch_request.old_text, patch_request.new_text, 1),
+        encoding="utf-8",
+    )
+    return PatchResult(
+        success=True,
+        path=patch_request.path,
+        replacements=1,
+        message="Patch applied successfully.",
+    )
 
 
 def search_code(
