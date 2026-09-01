@@ -431,6 +431,7 @@ def test_run_flutter_tests_uses_a_fixed_flutter_command(monkeypatch, tmp_path) -
         stdout="All passed",
         stderr="",
         success=True,
+        output_truncated=False,
     )
     assert calls == [
         (
@@ -464,6 +465,7 @@ def test_run_dart_analyze_uses_a_fixed_dart_command(monkeypatch, tmp_path) -> No
         stderr="",
         timed_out=False,
         success=False,
+        output_truncated=False,
     )
     assert calls == [
         (
@@ -498,6 +500,7 @@ def test_run_dart_analyze_returns_a_timeout_result(monkeypatch, tmp_path) -> Non
         stderr="partial error",
         timed_out=True,
         success=False,
+        output_truncated=False,
     )
 
 
@@ -519,6 +522,7 @@ def test_run_flutter_tests_truncates_large_output(monkeypatch, tmp_path) -> None
 
     assert result.stdout == "a" * 10_000 + "b" * 10_000
     assert result.stderr == "c" * 10_000 + "d" * 10_000
+    assert result.output_truncated is True
 
 
 def test_run_dart_analyze_truncates_large_output(monkeypatch, tmp_path) -> None:
@@ -539,6 +543,7 @@ def test_run_dart_analyze_truncates_large_output(monkeypatch, tmp_path) -> None:
 
     assert result.stdout == "a" * 10_000 + "b" * 10_000
     assert result.stderr == "c" * 10_000 + "d" * 10_000
+    assert result.output_truncated is True
 
 
 def test_run_dart_format_uses_a_fixed_dart_command(monkeypatch, tmp_path) -> None:

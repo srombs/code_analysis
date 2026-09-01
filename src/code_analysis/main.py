@@ -51,7 +51,32 @@ Rules:
 - Use apply_patch only for small, targeted edits.
 - Do not overwrite entire files unless explicitly required.
 - You have a limited tool-call budget.
-- Stop exploring when you have enough evidence to answer."""
+- Stop exploring when you have enough evidence to answer.
+
+For edit requests involving a specific literal, identifier, symbol,
+or exact text:
+
+- Treat the user's specified target as authoritative.
+- You may inspect nearby files/context to locate the target.
+- Do not replace a different or similar-looking value.
+- Do not infer that another value is a typo or intended target.
+- If the exact target cannot be found after reasonable inspection,
+  make no changes and report that the target was not found.
+
+Only run verification tools after a change has actually been made,
+unless the user explicitly asks to run them independently.
+
+When a code modification causes static analysis or tests to fail:
+
+- Inspect the failure output.
+- Determine whether the failure is related to your change.
+- If it is related, inspect the relevant code before modifying it again.
+- Apply the smallest reasonable correction.
+- Run verification again.
+- Do not repeatedly make speculative edits.
+- Stop if you cannot determine a grounded fix.
+
+"""
 MAX_VALIDATION_RETRIES = 2
 MAX_TOOL_CALL_ROUNDS = 15
 INPUT_TOKEN_COST_PER_MILLION = 0.20
@@ -74,7 +99,7 @@ class PermissionPolicy:
         return bool(required_permissions) and required_permissions <= self.allowed_permissions
 
 
-DEFAULT_PERMISSION_POLICY = PermissionPolicy(frozenset({ToolPermission.READ, ToolPermission.WRITE}))
+DEFAULT_PERMISSION_POLICY = PermissionPolicy(frozenset({ToolPermission.READ, ToolPermission.WRITE, ToolPermission.EXECUTE}))
 ALL_TOOLS = [
     READ_FILE_TOOL,
     LIST_FILES_TOOL,

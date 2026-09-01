@@ -129,6 +129,7 @@ class FlutterTestResult:
     stdout: str
     stderr: str
     success: bool
+    output_truncated: bool
 
 
 @dataclass(frozen=True)
@@ -140,6 +141,7 @@ class DartAnalyzeResult:
     stderr: str
     timed_out: bool
     success: bool
+    output_truncated: bool
 
 
 @dataclass(frozen=True)
@@ -277,7 +279,8 @@ RUN_FLUTTER_TESTS_TOOL = {
     "description": (
         "Run the full Flutter test suite with `flutter test` in the application-provided "
         "project root. This executes project code and requires execute permission. Return "
-        "the process exit code, standard output, standard error, and success status."
+        "the process exit code, standard output, standard error, success status, and "
+        "whether output was truncated."
     ),
     "parameters": {
         "type": "object",
@@ -295,7 +298,8 @@ RUN_DART_ANALYZE_TOOL = {
     "description": (
         "Run `dart analyze` in the application-provided project root. This executes the "
         "Dart analyzer and requires execute permission. Return the process exit code, "
-        "standard output, standard error, timeout status, and success status."
+        "standard output, standard error, timeout status, success status, and whether "
+        "output was truncated."
     ),
     "parameters": {
         "type": "object",
@@ -416,6 +420,10 @@ def run_flutter_tests(
         stdout=_truncate_tool_output(completed_process.stdout),
         stderr=_truncate_tool_output(completed_process.stderr),
         success=completed_process.returncode == 0,
+        output_truncated=_tool_output_was_truncated(
+            completed_process.stdout,
+            completed_process.stderr,
+        ),
     )
 
 
@@ -437,12 +445,15 @@ def run_dart_analyze(
             timeout=300,
         )
     except subprocess.TimeoutExpired as error:
+        stdout = _timeout_stream_to_text(error.stdout)
+        stderr = _timeout_stream_to_text(error.stderr)
         return DartAnalyzeResult(
             exit_code=None,
-            stdout=_truncate_tool_output(_timeout_stream_to_text(error.stdout)),
-            stderr=_truncate_tool_output(_timeout_stream_to_text(error.stderr)),
+            stdout=_truncate_tool_output(stdout),
+            stderr=_truncate_tool_output(stderr),
             timed_out=True,
             success=False,
+            output_truncated=_tool_output_was_truncated(stdout, stderr),
         )
 
     return DartAnalyzeResult(
@@ -451,6 +462,10 @@ def run_dart_analyze(
         stderr=_truncate_tool_output(completed_process.stderr),
         timed_out=False,
         success=completed_process.returncode == 0,
+        output_truncated=_tool_output_was_truncated(
+            completed_process.stdout,
+            completed_process.stderr,
+        ),
     )
 
 
@@ -468,6 +483,11 @@ def _truncate_tool_output(text: str) -> str:
     if len(text) <= MAX_TOOL_OUTPUT_CHARS:
         return text
     return text[:TOOL_OUTPUT_EDGE_CHARS] + text[-TOOL_OUTPUT_EDGE_CHARS:]
+
+
+def _tool_output_was_truncated(stdout: str, stderr: str) -> bool:
+    """Return whether either captured stream exceeded the model-output limit."""
+    return len(stdout) > MAX_TOOL_OUTPUT_CHARS or len(stderr) > MAX_TOOL_OUTPUT_CHARS
 
 
 def run_dart_format(
