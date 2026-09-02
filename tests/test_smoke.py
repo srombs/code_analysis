@@ -17,6 +17,7 @@ from code_analysis.tool_schemas import (
     RUN_FLUTTER_TESTS_TOOL,
     SEARCH_CODE_MAX_RESULTS,
     SEARCH_CODE_TOOL,
+    DartAnalyzeIssue,
     DartAnalyzeResult,
     DartFormatResult,
     FileAccessPolicy,
@@ -162,7 +163,7 @@ def test_permission_policy_defaults_to_read_only_and_honors_cli_values() -> None
     assert main.DEFAULT_PERMISSION_POLICY.allows(READ_FILE_TOOL["name"])
     assert (
         main.format_permission_policy(main.DEFAULT_PERMISSION_POLICY)
-        == "Allowed permissions: read, write"
+        == "Allowed permissions: execute, read, write"
     )
 
     explicit_policy = main.permission_policy_from_cli_values(["write", "external"])
@@ -251,6 +252,7 @@ def test_apply_patch_replaces_one_unique_match(tmp_path, capsys) -> None:
         write_policy,
         file_access_policy_for(tmp_path),
         {"lib/example.dart"},
+        analyzer_verification_state=main.AnalyzerVerificationState(baseline_output="baseline"),
     ) == [
         {
             "type": "function_call_output",
@@ -293,6 +295,7 @@ def test_apply_patch_rejects_ambiguous_old_text_matches(tmp_path, capsys) -> Non
         write_policy,
         file_access_policy_for(tmp_path),
         {"lib/example.dart"},
+        analyzer_verification_state=main.AnalyzerVerificationState(baseline_output="baseline"),
     ) == [
         {
             "type": "function_call_output",
@@ -400,6 +403,7 @@ def test_read_file_allows_a_later_patch_for_the_same_file(tmp_path) -> None:
         read_write_policy,
         file_access_policy_for(tmp_path),
         changed_file_paths=changed_file_paths,
+        analyzer_verification_state=main.AnalyzerVerificationState(baseline_output="baseline"),
     )
 
     assert tool_outputs[1] == {
@@ -412,6 +416,122 @@ def test_read_file_allows_a_later_patch_for_the_same_file(tmp_path) -> None:
     }
     assert source_file.read_text(encoding="utf-8") == "after"
     assert changed_file_paths == {"example.dart"}
+
+
+def test_apply_patch_requires_a_dart_analyze_baseline(tmp_path) -> None:
+    (tmp_path / "example.dart").write_text("before", encoding="utf-8")
+    tool_call = type(
+        "ToolCall",
+        (),
+        {
+            "type": "function_call",
+            "name": "apply_patch",
+            "arguments": ('{"path": "example.dart", "old_text": "before", "new_text": "after"}'),
+            "call_id": "call_patch",
+        },
+    )()
+    response = type("Response", (), {"output": [tool_call]})()
+    read_write_policy = main.PermissionPolicy(
+        frozenset({ToolPermission.READ, ToolPermission.WRITE})
+    )
+
+    assert main.execute_file_tool_calls(
+        response,
+        read_write_policy,
+        file_access_policy_for(tmp_path),
+        {"example.dart"},
+    )[0]["output"] == (
+        '{"success": false, "path": "example.dart", "replacements": 0, '
+        '"message": "Run dart analyze before applying a patch to establish a baseline."}'
+    )
+
+
+def test_analyzer_output_diff_identifies_new_output() -> None:
+    assert main._analyzer_output_diff(
+        "stdout:\nexisting issue\nstderr:\n",
+        "stdout:\nexisting issue\nnew issue\nstderr:\n",
+    ) == (
+        "--- baseline\n+++ current\n@@ -1,3 +1,4 @@\n"
+        " stdout:\n existing issue\n+new issue\n stderr:"
+    )
+
+
+def test_analyzer_issue_count_reads_dart_analyzer_summaries() -> None:
+    assert main._analyzer_issue_count("No issues found!") == 0
+    assert main._analyzer_issue_count("Analyzed 12 files, 1 issue found.") == 1
+    assert main._analyzer_issue_count("3 issues found.") == 3
+    assert main._analyzer_issue_count("analyzer failed before producing a summary") is None
+
+
+def test_repair_attempts_are_limited_after_a_verification_failure(monkeypatch, tmp_path) -> None:
+    source_file = tmp_path / "example.dart"
+    source_file.write_text("before", encoding="utf-8")
+    read_call = type(
+        "ToolCall",
+        (),
+        {
+            "type": "function_call",
+            "name": "read_file",
+            "arguments": '{"file_path": "example.dart"}',
+            "call_id": "call_read",
+        },
+    )()
+    analyze_call = type(
+        "ToolCall",
+        (),
+        {
+            "type": "function_call",
+            "name": "run_dart_analyze",
+            "arguments": "{}",
+            "call_id": "call_analyze",
+        },
+    )()
+    patch_calls = [
+        type(
+            "ToolCall",
+            (),
+            {
+                "type": "function_call",
+                "name": "apply_patch",
+                "arguments": (
+                    '{"path": "example.dart", "old_text": "before", "new_text": "after"}'
+                ),
+                "call_id": f"call_patch_{attempt}",
+            },
+        )()
+        for attempt in range(4)
+    ]
+    response = type("Response", (), {"output": [read_call, analyze_call, *patch_calls]})()
+    permission_policy = main.PermissionPolicy(
+        frozenset({ToolPermission.READ, ToolPermission.WRITE, ToolPermission.EXECUTE})
+    )
+    monkeypatch.setattr(
+        main,
+        "run_dart_analyze",
+        lambda project_path: DartAnalyzeResult(
+            exit_code=1,
+            stdout="Issue found",
+            stderr="",
+            timed_out=False,
+            success=False,
+            output_truncated=False,
+            issues=(),
+        ),
+    )
+    repair_state = main.RepairState()
+
+    tool_outputs = main.execute_file_tool_calls(
+        response,
+        permission_policy,
+        file_access_policy_for(tmp_path),
+        repair_state=repair_state,
+    )
+
+    assert repair_state.attempts == main.MAX_REPAIR_ATTEMPTS
+    assert tool_outputs[-1]["output"] == (
+        '{"success": false, "path": "example.dart", "replacements": 0, '
+        '"message": "Repair attempt limit reached (3 attempts)."}'
+    )
 
 
 def test_run_flutter_tests_uses_a_fixed_flutter_command(monkeypatch, tmp_path) -> None:
@@ -466,6 +586,7 @@ def test_run_dart_analyze_uses_a_fixed_dart_command(monkeypatch, tmp_path) -> No
         timed_out=False,
         success=False,
         output_truncated=False,
+        issues=(),
     )
     assert calls == [
         (
@@ -501,6 +622,7 @@ def test_run_dart_analyze_returns_a_timeout_result(monkeypatch, tmp_path) -> Non
         timed_out=True,
         success=False,
         output_truncated=False,
+        issues=(),
     )
 
 
@@ -544,6 +666,41 @@ def test_run_dart_analyze_truncates_large_output(monkeypatch, tmp_path) -> None:
     assert result.stdout == "a" * 10_000 + "b" * 10_000
     assert result.stderr == "c" * 10_000 + "d" * 10_000
     assert result.output_truncated is True
+
+
+def test_run_dart_analyze_parses_structured_issues(monkeypatch, tmp_path) -> None:
+    (tmp_path / "pubspec.yaml").write_text("name: test_project", encoding="utf-8")
+
+    def fake_run(command, **kwargs):
+        return type(
+            "CompletedProcess",
+            (),
+            {
+                "returncode": 1,
+                "stdout": (
+                    "error - lib/example.dart:12:4 - Missing semicolon - expected_token\n"
+                    "warning - Unused import - lib/unused.dart:3:1 - unused_import\n"
+                ),
+                "stderr": "",
+            },
+        )()
+
+    monkeypatch.setattr(tool_schemas.subprocess, "run", fake_run)
+
+    assert run_dart_analyze(tmp_path).issues == (
+        DartAnalyzeIssue(
+            path="lib/example.dart",
+            line_number=12,
+            severity="error",
+            message="Missing semicolon",
+        ),
+        DartAnalyzeIssue(
+            path="lib/unused.dart",
+            line_number=3,
+            severity="warning",
+            message="Unused import",
+        ),
+    )
 
 
 def test_run_dart_format_uses_a_fixed_dart_command(monkeypatch, tmp_path) -> None:
@@ -954,6 +1111,8 @@ def test_analyze_text_uses_luna_model() -> None:
                 main.READ_FILE_TOOL,
                 main.LIST_FILES_TOOL,
                 main.SEARCH_CODE_TOOL,
+                main.RUN_FLUTTER_TESTS_TOOL,
+                main.RUN_DART_ANALYZE_TOOL,
                 main.RUN_DART_FORMAT_TOOL,
                 main.APPLY_PATCH_TOOL,
             ],
@@ -1448,7 +1607,7 @@ def test_main_prints_model_response(monkeypatch, capsys, tmp_path) -> None:
 
     assert (
         capsys.readouterr().out
-        == "Allowed permissions: read, write\nFormatted analysis result\nMetrics\n"
+        == "Allowed permissions: execute, read, write\nFormatted analysis result\nMetrics\n"
         "Changed Files\n  No files changed.\n"
     )
 

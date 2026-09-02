@@ -1,7 +1,9 @@
 """Command-line entry point for code-analysis."""
 
 import argparse
+import difflib
 import json
+import re
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -18,9 +20,11 @@ from code_analysis.tool_schemas import (
     RUN_DART_FORMAT_TOOL,
     RUN_FLUTTER_TESTS_TOOL,
     SEARCH_CODE_TOOL,
+    DartAnalyzeResult,
     FileAccessPolicy,
     FileState,
     PatchRequest,
+    PatchResult,
     ToolPermission,
     apply_patch,
     get_tool_permissions,
@@ -75,16 +79,38 @@ When a code modification causes static analysis or tests to fail:
 - Run verification again.
 - Do not repeatedly make speculative edits.
 - Stop if you cannot determine a grounded fix.
+- Make no more than three repair attempts in one agent run.
+- Run dart analyze before applying a patch to establish a baseline, and again after a
+  successful patch to verify it.
 
 """
 MAX_VALIDATION_RETRIES = 2
 MAX_TOOL_CALL_ROUNDS = 15
+MAX_REPAIR_ATTEMPTS = 3
+MAX_ANALYZER_DIFF_CHARS = 20_000
 INPUT_TOKEN_COST_PER_MILLION = 0.20
 OUTPUT_TOKEN_COST_PER_MILLION = 1.20
 
 
 class AnalysisError(Exception):
     """Raised when the model request cannot be completed."""
+
+
+@dataclass
+class RepairState:
+    """Repair progress tracked locally throughout one agent run."""
+
+    attempts: int = 0
+    verification_failed: bool = False
+
+
+@dataclass
+class AnalyzerVerificationState:
+    """The Dart analyzer baseline retained across one agent run."""
+
+    baseline_output: str | None = None
+    baseline_issue_count: int | None = None
+    patch_applied_since_baseline: bool = False
 
 
 @dataclass(frozen=True)
@@ -99,7 +125,9 @@ class PermissionPolicy:
         return bool(required_permissions) and required_permissions <= self.allowed_permissions
 
 
-DEFAULT_PERMISSION_POLICY = PermissionPolicy(frozenset({ToolPermission.READ, ToolPermission.WRITE, ToolPermission.EXECUTE}))
+DEFAULT_PERMISSION_POLICY = PermissionPolicy(
+    frozenset({ToolPermission.READ, ToolPermission.WRITE, ToolPermission.EXECUTE})
+)
 ALL_TOOLS = [
     READ_FILE_TOOL,
     LIST_FILES_TOOL,
@@ -214,11 +242,19 @@ def execute_file_tool_calls(
     file_access_policy: FileAccessPolicy | None = None,
     read_file_paths: set[str] | None = None,
     changed_file_paths: set[str] | None = None,
+    repair_state: RepairState | None = None,
+    analyzer_verification_state: AnalyzerVerificationState | None = None,
 ) -> list[dict[str, str]]:
     """Execute requested file tools and format their results for the API."""
     tool_outputs = []
     read_file_paths = read_file_paths if read_file_paths is not None else set()
     changed_file_paths = changed_file_paths if changed_file_paths is not None else set()
+    repair_state = repair_state if repair_state is not None else RepairState()
+    analyzer_verification_state = (
+        analyzer_verification_state
+        if analyzer_verification_state is not None
+        else AnalyzerVerificationState()
+    )
 
     for output_item in getattr(response, "output", []):
         if getattr(output_item, "type", None) != "function_call":
@@ -280,6 +316,7 @@ def execute_file_tool_calls(
 
                 print("Tool call: run_flutter_tests()")
                 test_result = run_flutter_tests(file_access_policy.root_path)
+                repair_state.verification_failed = not test_result.success
                 output = json.dumps(asdict(test_result))
                 print(f"Tool result: flutter test exited with code {test_result.exit_code}")
                 print(f"Tool output:\n{json.dumps(asdict(test_result), indent=2)}")
@@ -289,11 +326,42 @@ def execute_file_tool_calls(
 
                 print("Tool call: run_dart_analyze()")
                 analyze_result = run_dart_analyze(file_access_policy.root_path)
-                output = json.dumps(asdict(analyze_result))
+                repair_state.verification_failed = not analyze_result.success
+                analyzer_output = _analyzer_output(analyze_result)
+                issue_count = _analyzer_issue_count(analyzer_output)
+                baseline_diff = ""
+                new_issues_introduced = False
+                if analyzer_verification_state.patch_applied_since_baseline:
+                    baseline_diff = _analyzer_output_diff(
+                        analyzer_verification_state.baseline_output or "",
+                        analyzer_output,
+                    )
+                    new_issues_introduced = (
+                        issue_count is not None
+                        and analyzer_verification_state.baseline_issue_count is not None
+                        and issue_count > analyzer_verification_state.baseline_issue_count
+                    )
+                analyzer_verification_state.baseline_output = analyzer_output
+                analyzer_verification_state.baseline_issue_count = issue_count
+                analyzer_verification_state.patch_applied_since_baseline = False
+                output = json.dumps(
+                    {
+                        "analysis": asdict(analyze_result),
+                        "issue_count": issue_count,
+                        "baseline_diff": baseline_diff or None,
+                        "new_issues_introduced": new_issues_introduced,
+                    }
+                )
                 if analyze_result.timed_out:
                     print("Tool result: dart analyze timed out")
                 else:
                     print(f"Tool result: dart analyze exited with code {analyze_result.exit_code}")
+                if issue_count is None:
+                    print("Tool result: dart analyze issue count unavailable")
+                else:
+                    print(f"Tool result: dart analyze reported {issue_count} issues")
+                if new_issues_introduced:
+                    print("Tool result: new analyzer issues introduced")
                 print(f"Tool output:\n{json.dumps(asdict(analyze_result), indent=2)}")
             elif output_item.name == RUN_DART_FORMAT_TOOL["name"]:
                 if not isinstance(arguments, dict) or arguments:
@@ -316,13 +384,39 @@ def execute_file_tool_calls(
 
                 patch_request = PatchRequest(**arguments)
                 print(f"Tool call: apply_patch({patch_request.path})")
-                patch_result = apply_patch(
-                    patch_request,
-                    file_access_policy,
-                    read_file_paths,
-                )
+                if analyzer_verification_state.baseline_output is None:
+                    patch_result = PatchResult(
+                        success=False,
+                        path=patch_request.path,
+                        replacements=0,
+                        message="Run dart analyze before applying a patch to establish a baseline.",
+                    )
+                elif repair_state.verification_failed:
+                    if repair_state.attempts >= MAX_REPAIR_ATTEMPTS:
+                        patch_result = PatchResult(
+                            success=False,
+                            path=patch_request.path,
+                            replacements=0,
+                            message=(
+                                f"Repair attempt limit reached ({MAX_REPAIR_ATTEMPTS} attempts)."
+                            ),
+                        )
+                    else:
+                        repair_state.attempts += 1
+                        patch_result = apply_patch(
+                            patch_request,
+                            file_access_policy,
+                            read_file_paths,
+                        )
+                else:
+                    patch_result = apply_patch(
+                        patch_request,
+                        file_access_policy,
+                        read_file_paths,
+                    )
                 if patch_result.success:
                     changed_file_paths.add(patch_result.path)
+                    analyzer_verification_state.patch_applied_since_baseline = True
                 output = json.dumps(asdict(patch_result))
                 print(f"Tool result: {output}")
             else:
@@ -349,6 +443,8 @@ def request_analysis_with_tools(
     permission_policy: PermissionPolicy = DEFAULT_PERMISSION_POLICY,
     file_access_policy: FileAccessPolicy | None = None,
     changed_file_paths: set[str] | None = None,
+    repair_state: RepairState | None = None,
+    analyzer_verification_state: AnalyzerVerificationState | None = None,
 ) -> object:
     """Request an analysis and service file-read calls until it is complete."""
     request_options = {
@@ -364,6 +460,12 @@ def request_analysis_with_tools(
 
     read_file_paths = set()
     changed_file_paths = changed_file_paths if changed_file_paths is not None else set()
+    repair_state = repair_state if repair_state is not None else RepairState()
+    analyzer_verification_state = (
+        analyzer_verification_state
+        if analyzer_verification_state is not None
+        else AnalyzerVerificationState()
+    )
     for tool_round in range(MAX_TOOL_CALL_ROUNDS):
         tool_outputs = execute_file_tool_calls(
             response,
@@ -371,6 +473,8 @@ def request_analysis_with_tools(
             file_access_policy,
             read_file_paths,
             changed_file_paths,
+            repair_state,
+            analyzer_verification_state,
         )
         if not tool_outputs:
             return response
@@ -388,6 +492,36 @@ def request_analysis_with_tools(
     raise AnalysisError(f"Model requested more than {MAX_TOOL_CALL_ROUNDS} rounds of tooling.")
 
 
+def _analyzer_output(analyze_result: DartAnalyzeResult) -> str:
+    """Combine analyzer streams into a stable baseline representation."""
+    return f"stdout:\n{analyze_result.stdout}\nstderr:\n{analyze_result.stderr}"
+
+
+def _analyzer_output_diff(baseline_output: str, current_output: str) -> str:
+    """Return a bounded unified diff between analyzer runs."""
+    diff = "\n".join(
+        difflib.unified_diff(
+            baseline_output.splitlines(),
+            current_output.splitlines(),
+            fromfile="baseline",
+            tofile="current",
+            lineterm="",
+        )
+    )
+    if len(diff) <= MAX_ANALYZER_DIFF_CHARS:
+        return diff
+    edge_chars = MAX_ANALYZER_DIFF_CHARS // 2
+    return diff[:edge_chars] + diff[-edge_chars:]
+
+
+def _analyzer_issue_count(analyzer_output: str) -> int | None:
+    """Extract Dart analyzer's reported issue count from its output."""
+    if re.search(r"\bno issues found\b", analyzer_output, flags=re.IGNORECASE):
+        return 0
+    match = re.search(r"\b(\d+) issues? found\b", analyzer_output, flags=re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
 def analyze_text(
     text: str,
     instructions: str,
@@ -401,6 +535,8 @@ def analyze_text(
     numbered_source = number_source_lines(text)
 
     changed_file_paths = changed_file_paths if changed_file_paths is not None else set()
+    repair_state = RepairState()
+    analyzer_verification_state = AnalyzerVerificationState()
     for attempt in range(MAX_VALIDATION_RETRIES + 1):
         try:
             if simulate_validation_error_once and attempt == 0:
@@ -413,6 +549,8 @@ def analyze_text(
                 permission_policy,
                 file_access_policy,
                 changed_file_paths,
+                repair_state,
+                analyzer_verification_state,
             )
         except ValidationError as error:
             validation_error = error

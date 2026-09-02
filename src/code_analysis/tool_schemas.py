@@ -1,6 +1,7 @@
 """Schemas and implementations for custom code-analysis tools."""
 
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from enum import StrEnum
@@ -142,6 +143,17 @@ class DartAnalyzeResult:
     timed_out: bool
     success: bool
     output_truncated: bool
+    issues: tuple["DartAnalyzeIssue", ...]
+
+
+@dataclass(frozen=True)
+class DartAnalyzeIssue:
+    """One issue reported by the Dart analyzer."""
+
+    path: str
+    line_number: int
+    severity: str
+    message: str
 
 
 @dataclass(frozen=True)
@@ -299,7 +311,7 @@ RUN_DART_ANALYZE_TOOL = {
         "Run `dart analyze` in the application-provided project root. This executes the "
         "Dart analyzer and requires execute permission. Return the process exit code, "
         "standard output, standard error, timeout status, success status, and whether "
-        "output was truncated."
+        "output was truncated, along with structured reported issues."
     ),
     "parameters": {
         "type": "object",
@@ -445,27 +457,33 @@ def run_dart_analyze(
             timeout=300,
         )
     except subprocess.TimeoutExpired as error:
-        stdout = _timeout_stream_to_text(error.stdout)
-        stderr = _timeout_stream_to_text(error.stderr)
+        raw_stdout = _timeout_stream_to_text(error.stdout)
+        raw_stderr = _timeout_stream_to_text(error.stderr)
+        stdout = _truncate_tool_output(raw_stdout)
+        stderr = _truncate_tool_output(raw_stderr)
         return DartAnalyzeResult(
             exit_code=None,
-            stdout=_truncate_tool_output(stdout),
-            stderr=_truncate_tool_output(stderr),
+            stdout=stdout,
+            stderr=stderr,
             timed_out=True,
             success=False,
-            output_truncated=_tool_output_was_truncated(stdout, stderr),
+            output_truncated=_tool_output_was_truncated(raw_stdout, raw_stderr),
+            issues=_parse_dart_analyze_issues(stdout, stderr),
         )
 
+    stdout = _truncate_tool_output(completed_process.stdout)
+    stderr = _truncate_tool_output(completed_process.stderr)
     return DartAnalyzeResult(
         exit_code=completed_process.returncode,
-        stdout=_truncate_tool_output(completed_process.stdout),
-        stderr=_truncate_tool_output(completed_process.stderr),
+        stdout=stdout,
+        stderr=stderr,
         timed_out=False,
         success=completed_process.returncode == 0,
         output_truncated=_tool_output_was_truncated(
             completed_process.stdout,
             completed_process.stderr,
         ),
+        issues=_parse_dart_analyze_issues(stdout, stderr),
     )
 
 
@@ -488,6 +506,39 @@ def _truncate_tool_output(text: str) -> str:
 def _tool_output_was_truncated(stdout: str, stderr: str) -> bool:
     """Return whether either captured stream exceeded the model-output limit."""
     return len(stdout) > MAX_TOOL_OUTPUT_CHARS or len(stderr) > MAX_TOOL_OUTPUT_CHARS
+
+
+def _parse_dart_analyze_issues(stdout: str, stderr: str) -> tuple[DartAnalyzeIssue, ...]:
+    """Parse supported human-readable Dart analyzer issue formats."""
+    issues = []
+    for output_line in f"{stdout}\n{stderr}".splitlines():
+        path_first_match = re.fullmatch(
+            r"(?P<severity>error|warning|info)\s*-\s*"
+            r"(?P<path>.+?):(?P<line>\d+):\d+\s*-\s*"
+            r"(?P<message>.+?)(?:\s*-\s*\S+)?",
+            output_line,
+            flags=re.IGNORECASE,
+        )
+        message_first_match = re.fullmatch(
+            r"(?P<severity>error|warning|info)\s*-\s*"
+            r"(?P<message>.+?)\s*-\s*"
+            r"(?P<path>.+?):(?P<line>\d+):\d+(?:\s*-\s*\S+)?",
+            output_line,
+            flags=re.IGNORECASE,
+        )
+        match = message_first_match or path_first_match
+        if match is None:
+            continue
+
+        issues.append(
+            DartAnalyzeIssue(
+                path=match["path"],
+                line_number=int(match["line"]),
+                severity=match["severity"].lower(),
+                message=match["message"],
+            )
+        )
+    return tuple(issues)
 
 
 def run_dart_format(
