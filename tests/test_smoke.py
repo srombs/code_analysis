@@ -145,16 +145,12 @@ def test_tool_permissions_describe_the_current_read_only_tools() -> None:
     assert get_tool_permissions(READ_FILE_TOOL["name"]) == frozenset({ToolPermission.READ})
     assert get_tool_permissions(LIST_FILES_TOOL["name"]) == frozenset({ToolPermission.READ})
     assert get_tool_permissions(SEARCH_CODE_TOOL["name"]) == frozenset({ToolPermission.READ})
-    assert get_tool_permissions(RUN_FLUTTER_TESTS_TOOL["name"]) == frozenset(
-        {ToolPermission.EXECUTE}
-    )
+    assert get_tool_permissions(RUN_FLUTTER_TESTS_TOOL["name"]) == frozenset()
     assert get_tool_permissions(RUN_DART_ANALYZE_TOOL["name"]) == frozenset(
         {ToolPermission.EXECUTE}
     )
-    assert get_tool_permissions(RUN_DART_FORMAT_TOOL["name"]) == frozenset({ToolPermission.WRITE})
-    assert get_tool_permissions(APPLY_PATCH_TOOL["name"]) == frozenset(
-        {ToolPermission.READ, ToolPermission.WRITE}
-    )
+    assert get_tool_permissions(RUN_DART_FORMAT_TOOL["name"]) == frozenset()
+    assert get_tool_permissions(APPLY_PATCH_TOOL["name"]) == frozenset({ToolPermission.WRITE})
     assert get_tool_permissions("unknown_tool") == frozenset()
 
 
@@ -172,6 +168,116 @@ def test_permission_policy_defaults_to_read_only_and_honors_cli_values() -> None
         {ToolPermission.WRITE, ToolPermission.EXTERNAL}
     )
     assert explicit_policy.allows(READ_FILE_TOOL["name"]) is False
+
+
+def test_agent_run_state_starts_with_isolated_empty_workflow_state() -> None:
+    first_state = main.AgentRunState()
+    second_state = main.AgentRunState()
+
+    first_state.changed_file_paths.add("lib/example.dart")
+    first_state.read_file_paths.add("lib/example.dart")
+
+    assert first_state.verification_dirty is False
+    assert first_state.repair_attempts == 0
+    assert first_state.analyzer_baseline_output is None
+    assert first_state.analyzer_baseline_issue_count is None
+    assert first_state.verification_failed is False
+    assert second_state.changed_file_paths == set()
+    assert second_state.read_file_paths == set()
+
+
+def test_completion_check_reports_incomplete_agent_run_state() -> None:
+    assert main.check_agent_completion(
+        main.AgentRunState(changed_file_paths=set())
+    ) == main.AgentCompletionCheck(
+        passed=True,
+        failures=(),
+    )
+
+
+def test_completion_rejection_message_instructs_the_model_to_continue() -> None:
+    assert main.completion_rejection_message(
+        main.AgentCompletionCheck(
+            passed=False,
+            failures=(
+                "A file was changed but has not been verified. Run the appropriate "
+                "verification tool.",
+                "The most recent verification failed. Inspect its output before making a "
+                "grounded repair.",
+            ),
+        )
+    ) == {
+        "role": "system",
+        "content": (
+            "Completion rejected by the harness:\n"
+            "A file was changed but has not been verified. Run the appropriate "
+            "verification tool.\n"
+            "The most recent verification failed. Inspect its output before making a "
+            "grounded repair.\n"
+            "Continue working on the task."
+        ),
+    }
+
+
+def test_incomplete_run_continues_with_a_harness_completion_rejection(capsys) -> None:
+    run_state = main.AgentRunState(verification_dirty=True)
+    initial_response = type("Response", (), {"id": "response_initial", "output": []})()
+    completed_response = type("Response", (), {"id": "response_completed", "output": []})()
+    calls = []
+
+    class FakeResponses:
+        def parse(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return initial_response
+
+            run_state.verification_dirty = False
+            return completed_response
+
+    client = type("Client", (), {"responses": FakeResponses()})()
+
+    assert (
+        main.request_analysis_with_tools(
+            "",
+            "Complete the task.",
+            client,
+            run_state=run_state,
+        )
+        is completed_response
+    )
+    assert calls[1]["input"] == [
+        {
+            "role": "system",
+            "content": (
+                "Completion rejected by the harness:\n"
+                "A file was changed but has not been verified. Run the appropriate "
+                "verification tool.\n"
+                "Continue working on the task."
+            ),
+        }
+    ]
+    assert calls[1]["previous_response_id"] == "response_initial"
+    assert capsys.readouterr().out == (
+        "Completion rejected by the harness:\n"
+        "A file was changed but has not been verified. Run the appropriate verification tool.\n"
+        "Continue working on the task.\n"
+    )
+    assert main.check_agent_completion(
+        main.AgentRunState(
+            verification_dirty=True,
+            verification_failed=True,
+            repair_attempts=main.MAX_REPAIR_ATTEMPTS,
+        )
+    ) == main.AgentCompletionCheck(
+        passed=False,
+        failures=(
+            "A file was changed but has not been verified. Run the appropriate verification tool.",
+            "The most recent verification failed. Inspect its output before making a "
+            "grounded repair.",
+            "The repair limit of 3 attempts was reached. Do not make another repair; report "
+            "the unresolved verification failure.",
+        ),
+    )
 
 
 def test_root_path_requires_an_existing_directory(tmp_path) -> None:
@@ -217,16 +323,13 @@ def test_permission_policy_rejects_a_tool_without_its_required_permission() -> N
 def test_execute_permission_exposes_the_execute_tools() -> None:
     execute_policy = main.PermissionPolicy(frozenset({ToolPermission.EXECUTE}))
 
-    assert main.tools_allowed_by(execute_policy) == [
-        RUN_FLUTTER_TESTS_TOOL,
-        RUN_DART_ANALYZE_TOOL,
-    ]
+    assert main.tools_allowed_by(execute_policy) == [RUN_DART_ANALYZE_TOOL]
 
 
 def test_write_permission_exposes_the_write_tools() -> None:
     write_policy = main.PermissionPolicy(frozenset({ToolPermission.WRITE}))
 
-    assert main.tools_allowed_by(write_policy) == [RUN_DART_FORMAT_TOOL]
+    assert main.tools_allowed_by(write_policy) == [APPLY_PATCH_TOOL]
 
 
 def test_apply_patch_replaces_one_unique_match(tmp_path, capsys) -> None:
@@ -251,8 +354,10 @@ def test_apply_patch_replaces_one_unique_match(tmp_path, capsys) -> None:
         response,
         write_policy,
         file_access_policy_for(tmp_path),
-        {"lib/example.dart"},
-        analyzer_verification_state=main.AnalyzerVerificationState(baseline_output="baseline"),
+        main.AgentRunState(
+            read_file_paths={"lib/example.dart"},
+            analyzer_baseline_output="baseline",
+        ),
     ) == [
         {
             "type": "function_call_output",
@@ -294,8 +399,10 @@ def test_apply_patch_rejects_ambiguous_old_text_matches(tmp_path, capsys) -> Non
         response,
         write_policy,
         file_access_policy_for(tmp_path),
-        {"lib/example.dart"},
-        analyzer_verification_state=main.AnalyzerVerificationState(baseline_output="baseline"),
+        main.AgentRunState(
+            read_file_paths={"lib/example.dart"},
+            analyzer_baseline_output="baseline",
+        ),
     ) == [
         {
             "type": "function_call_output",
@@ -397,13 +504,12 @@ def test_read_file_allows_a_later_patch_for_the_same_file(tmp_path) -> None:
         frozenset({ToolPermission.READ, ToolPermission.WRITE})
     )
 
-    changed_file_paths = set()
+    run_state = main.AgentRunState(analyzer_baseline_output="baseline")
     tool_outputs = main.execute_file_tool_calls(
         response,
         read_write_policy,
         file_access_policy_for(tmp_path),
-        changed_file_paths=changed_file_paths,
-        analyzer_verification_state=main.AnalyzerVerificationState(baseline_output="baseline"),
+        run_state,
     )
 
     assert tool_outputs[1] == {
@@ -415,11 +521,13 @@ def test_read_file_allows_a_later_patch_for_the_same_file(tmp_path) -> None:
         ),
     }
     assert source_file.read_text(encoding="utf-8") == "after"
-    assert changed_file_paths == {"example.dart"}
+    assert run_state.changed_file_paths == {"example.dart"}
+    assert run_state.verification_dirty is True
 
 
 def test_apply_patch_requires_a_dart_analyze_baseline(tmp_path) -> None:
-    (tmp_path / "example.dart").write_text("before", encoding="utf-8")
+    source_file = tmp_path / "example.dart"
+    source_file.write_text("before", encoding="utf-8")
     tool_call = type(
         "ToolCall",
         (),
@@ -439,11 +547,12 @@ def test_apply_patch_requires_a_dart_analyze_baseline(tmp_path) -> None:
         response,
         read_write_policy,
         file_access_policy_for(tmp_path),
-        {"example.dart"},
+        main.AgentRunState(read_file_paths={"example.dart"}),
     )[0]["output"] == (
         '{"success": false, "path": "example.dart", "replacements": 0, '
         '"message": "Run dart analyze before applying a patch to establish a baseline."}'
     )
+    assert source_file.read_text(encoding="utf-8") == "before"
 
 
 def test_analyzer_output_diff_identifies_new_output() -> None:
@@ -463,7 +572,7 @@ def test_analyzer_issue_count_reads_dart_analyzer_summaries() -> None:
     assert main._analyzer_issue_count("analyzer failed before producing a summary") is None
 
 
-def test_repair_attempts_are_limited_after_a_verification_failure(monkeypatch, tmp_path) -> None:
+def test_repair_attempts_are_limited_after_a_verification_failure(tmp_path) -> None:
     source_file = tmp_path / "example.dart"
     source_file.write_text("before", encoding="utf-8")
     read_call = type(
@@ -474,16 +583,6 @@ def test_repair_attempts_are_limited_after_a_verification_failure(monkeypatch, t
             "name": "read_file",
             "arguments": '{"file_path": "example.dart"}',
             "call_id": "call_read",
-        },
-    )()
-    analyze_call = type(
-        "ToolCall",
-        (),
-        {
-            "type": "function_call",
-            "name": "run_dart_analyze",
-            "arguments": "{}",
-            "call_id": "call_analyze",
         },
     )()
     patch_calls = [
@@ -501,33 +600,23 @@ def test_repair_attempts_are_limited_after_a_verification_failure(monkeypatch, t
         )()
         for attempt in range(4)
     ]
-    response = type("Response", (), {"output": [read_call, analyze_call, *patch_calls]})()
+    response = type("Response", (), {"output": [read_call, *patch_calls]})()
     permission_policy = main.PermissionPolicy(
-        frozenset({ToolPermission.READ, ToolPermission.WRITE, ToolPermission.EXECUTE})
+        frozenset({ToolPermission.READ, ToolPermission.WRITE})
     )
-    monkeypatch.setattr(
-        main,
-        "run_dart_analyze",
-        lambda project_path: DartAnalyzeResult(
-            exit_code=1,
-            stdout="Issue found",
-            stderr="",
-            timed_out=False,
-            success=False,
-            output_truncated=False,
-            issues=(),
-        ),
+    run_state = main.AgentRunState(
+        analyzer_baseline_output="baseline",
+        verification_failed=True,
     )
-    repair_state = main.RepairState()
 
     tool_outputs = main.execute_file_tool_calls(
         response,
         permission_policy,
         file_access_policy_for(tmp_path),
-        repair_state=repair_state,
+        run_state,
     )
 
-    assert repair_state.attempts == main.MAX_REPAIR_ATTEMPTS
+    assert run_state.repair_attempts == main.MAX_REPAIR_ATTEMPTS
     assert tool_outputs[-1]["output"] == (
         '{"success": false, "path": "example.dart", "replacements": 0, '
         '"message": "Repair attempt limit reached (3 attempts)."}'
@@ -1111,9 +1200,7 @@ def test_analyze_text_uses_luna_model() -> None:
                 main.READ_FILE_TOOL,
                 main.LIST_FILES_TOOL,
                 main.SEARCH_CODE_TOOL,
-                main.RUN_FLUTTER_TESTS_TOOL,
                 main.RUN_DART_ANALYZE_TOOL,
-                main.RUN_DART_FORMAT_TOOL,
                 main.APPLY_PATCH_TOOL,
             ],
             "tool_choice": "auto",
@@ -1235,10 +1322,7 @@ def test_analyze_text_executes_a_requested_file_list_and_returns_its_output(
         }
     ]
     assert capsys.readouterr().out == (
-        "Tool call: list_files(widgets)\n"
-        "Tool result: listed 1 files\n"
-        "Tool output:\n"
-        "widgets/button.py\n"
+        "Tool call: list_files(widgets)\nTool result: listed 1 files\n"
     )
 
 
@@ -1583,7 +1667,7 @@ def test_main_prints_model_response(monkeypatch, capsys, tmp_path) -> None:
         simulate_validation_error_once,
         permission_policy,
         file_access_policy,
-        changed_file_paths,
+        run_state,
     ):
         return response
 
@@ -1609,6 +1693,7 @@ def test_main_prints_model_response(monkeypatch, capsys, tmp_path) -> None:
         capsys.readouterr().out
         == "Allowed permissions: execute, read, write\nFormatted analysis result\nMetrics\n"
         "Changed Files\n  No files changed.\n"
+        'Completion Check: {"passed": true, "failures": []}\n'
     )
 
 

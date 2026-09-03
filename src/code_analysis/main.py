@@ -5,7 +5,7 @@ import difflib
 import json
 import re
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from openai import OpenAI
@@ -37,7 +37,7 @@ from code_analysis.tool_schemas import (
 )
 
 MODEL = "gpt-5.6-luna"
-AGENT_INSTRUCTIONS = """You are a software repository exploration, rea, write agent.
+AGENT_INSTRUCTIONS = """You are a software repository exploration, read, write agent.
 
 Your job is to answer questions about the supplied repository using the available tools.
 
@@ -97,20 +97,24 @@ class AnalysisError(Exception):
 
 
 @dataclass
-class RepairState:
-    """Repair progress tracked locally throughout one agent run."""
+class AgentRunState:
+    """All workflow state the harness retains throughout one agent run."""
 
-    attempts: int = 0
+    changed_file_paths: set[str] = field(default_factory=set)
+    verification_dirty: bool = False
+    repair_attempts: int = 0
+    read_file_paths: set[str] = field(default_factory=set)
+    analyzer_baseline_output: str | None = None
+    analyzer_baseline_issue_count: int | None = None
     verification_failed: bool = False
 
 
-@dataclass
-class AnalyzerVerificationState:
-    """The Dart analyzer baseline retained across one agent run."""
+@dataclass(frozen=True)
+class AgentCompletionCheck:
+    """The harness's assessment of whether an agent run completed safely."""
 
-    baseline_output: str | None = None
-    baseline_issue_count: int | None = None
-    patch_applied_since_baseline: bool = False
+    passed: bool
+    failures: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -240,21 +244,11 @@ def execute_file_tool_calls(
     response: object,
     permission_policy: PermissionPolicy = DEFAULT_PERMISSION_POLICY,
     file_access_policy: FileAccessPolicy | None = None,
-    read_file_paths: set[str] | None = None,
-    changed_file_paths: set[str] | None = None,
-    repair_state: RepairState | None = None,
-    analyzer_verification_state: AnalyzerVerificationState | None = None,
+    run_state: AgentRunState | None = None,
 ) -> list[dict[str, str]]:
     """Execute requested file tools and format their results for the API."""
     tool_outputs = []
-    read_file_paths = read_file_paths if read_file_paths is not None else set()
-    changed_file_paths = changed_file_paths if changed_file_paths is not None else set()
-    repair_state = repair_state if repair_state is not None else RepairState()
-    analyzer_verification_state = (
-        analyzer_verification_state
-        if analyzer_verification_state is not None
-        else AnalyzerVerificationState()
-    )
+    run_state = run_state if run_state is not None else AgentRunState()
 
     for output_item in getattr(response, "output", []):
         if getattr(output_item, "type", None) != "function_call":
@@ -279,7 +273,7 @@ def execute_file_tool_calls(
                 file_path = arguments["file_path"]
                 print(f"Tool call: read_file({file_path})")
                 source_text = read_file(file_path, file_access_policy)
-                read_file_paths.add(file_path)
+                run_state.read_file_paths.add(file_path)
                 file_state = FileState(
                     file_path=file_path,
                     line_count=len(source_text.splitlines()),
@@ -295,7 +289,6 @@ def execute_file_tool_calls(
                 print(f"Tool call: list_files({directory_path})")
                 output = list_files(directory_path, file_access_policy)
                 print(f"Tool result: listed {len(output.splitlines())} files")
-                print(f"Tool output:\n{output or '(no files found)'}")
             elif output_item.name == SEARCH_CODE_TOOL["name"]:
                 if not isinstance(arguments, dict) or set(arguments) != {"query"}:
                     raise ValueError("tool arguments must contain only query")
@@ -316,7 +309,7 @@ def execute_file_tool_calls(
 
                 print("Tool call: run_flutter_tests()")
                 test_result = run_flutter_tests(file_access_policy.root_path)
-                repair_state.verification_failed = not test_result.success
+                run_state.verification_failed = not test_result.success
                 output = json.dumps(asdict(test_result))
                 print(f"Tool result: flutter test exited with code {test_result.exit_code}")
                 print(f"Tool output:\n{json.dumps(asdict(test_result), indent=2)}")
@@ -326,24 +319,24 @@ def execute_file_tool_calls(
 
                 print("Tool call: run_dart_analyze()")
                 analyze_result = run_dart_analyze(file_access_policy.root_path)
-                repair_state.verification_failed = not analyze_result.success
+                run_state.verification_failed = not analyze_result.success
                 analyzer_output = _analyzer_output(analyze_result)
                 issue_count = _analyzer_issue_count(analyzer_output)
                 baseline_diff = ""
                 new_issues_introduced = False
-                if analyzer_verification_state.patch_applied_since_baseline:
+                if run_state.verification_dirty:
                     baseline_diff = _analyzer_output_diff(
-                        analyzer_verification_state.baseline_output or "",
+                        run_state.analyzer_baseline_output or "",
                         analyzer_output,
                     )
                     new_issues_introduced = (
                         issue_count is not None
-                        and analyzer_verification_state.baseline_issue_count is not None
-                        and issue_count > analyzer_verification_state.baseline_issue_count
+                        and run_state.analyzer_baseline_issue_count is not None
+                        and issue_count > run_state.analyzer_baseline_issue_count
                     )
-                analyzer_verification_state.baseline_output = analyzer_output
-                analyzer_verification_state.baseline_issue_count = issue_count
-                analyzer_verification_state.patch_applied_since_baseline = False
+                    run_state.verification_dirty = not analyze_result.success
+                run_state.analyzer_baseline_output = analyzer_output
+                run_state.analyzer_baseline_issue_count = issue_count
                 output = json.dumps(
                     {
                         "analysis": asdict(analyze_result),
@@ -384,15 +377,15 @@ def execute_file_tool_calls(
 
                 patch_request = PatchRequest(**arguments)
                 print(f"Tool call: apply_patch({patch_request.path})")
-                if analyzer_verification_state.baseline_output is None:
+                if run_state.analyzer_baseline_output is None:
                     patch_result = PatchResult(
                         success=False,
                         path=patch_request.path,
                         replacements=0,
                         message="Run dart analyze before applying a patch to establish a baseline.",
                     )
-                elif repair_state.verification_failed:
-                    if repair_state.attempts >= MAX_REPAIR_ATTEMPTS:
+                elif run_state.verification_failed:
+                    if run_state.repair_attempts >= MAX_REPAIR_ATTEMPTS:
                         patch_result = PatchResult(
                             success=False,
                             path=patch_request.path,
@@ -402,21 +395,21 @@ def execute_file_tool_calls(
                             ),
                         )
                     else:
-                        repair_state.attempts += 1
+                        run_state.repair_attempts += 1
                         patch_result = apply_patch(
                             patch_request,
                             file_access_policy,
-                            read_file_paths,
+                            run_state.read_file_paths,
                         )
                 else:
                     patch_result = apply_patch(
                         patch_request,
                         file_access_policy,
-                        read_file_paths,
+                        run_state.read_file_paths,
                     )
                 if patch_result.success:
-                    changed_file_paths.add(patch_result.path)
-                    analyzer_verification_state.patch_applied_since_baseline = True
+                    run_state.changed_file_paths.add(patch_result.path)
+                    run_state.verification_dirty = True
                 output = json.dumps(asdict(patch_result))
                 print(f"Tool result: {output}")
             else:
@@ -442,9 +435,7 @@ def request_analysis_with_tools(
     client: OpenAI,
     permission_policy: PermissionPolicy = DEFAULT_PERMISSION_POLICY,
     file_access_policy: FileAccessPolicy | None = None,
-    changed_file_paths: set[str] | None = None,
-    repair_state: RepairState | None = None,
-    analyzer_verification_state: AnalyzerVerificationState | None = None,
+    run_state: AgentRunState | None = None,
 ) -> object:
     """Request an analysis and service file-read calls until it is complete."""
     request_options = {
@@ -458,26 +449,21 @@ def request_analysis_with_tools(
 
     response = client.responses.parse(**request_options)
 
-    read_file_paths = set()
-    changed_file_paths = changed_file_paths if changed_file_paths is not None else set()
-    repair_state = repair_state if repair_state is not None else RepairState()
-    analyzer_verification_state = (
-        analyzer_verification_state
-        if analyzer_verification_state is not None
-        else AnalyzerVerificationState()
-    )
+    run_state = run_state if run_state is not None else AgentRunState()
     for tool_round in range(MAX_TOOL_CALL_ROUNDS):
         tool_outputs = execute_file_tool_calls(
             response,
             permission_policy,
             file_access_policy,
-            read_file_paths,
-            changed_file_paths,
-            repair_state,
-            analyzer_verification_state,
+            run_state,
         )
         if not tool_outputs:
-            return response
+            completion = check_agent_completion(run_state)
+            if completion.passed:
+                return response
+            rejection_message = completion_rejection_message(completion)
+            print(rejection_message["content"])
+            tool_outputs = [rejection_message]
 
         response = client.responses.parse(
             model=MODEL,
@@ -529,14 +515,12 @@ def analyze_text(
     simulate_validation_error_once: bool = False,
     permission_policy: PermissionPolicy = DEFAULT_PERMISSION_POLICY,
     file_access_policy: FileAccessPolicy | None = None,
-    changed_file_paths: set[str] | None = None,
+    run_state: AgentRunState | None = None,
 ) -> object:
     """Send text for analysis and return a response containing an AnalysisResult."""
     numbered_source = number_source_lines(text)
 
-    changed_file_paths = changed_file_paths if changed_file_paths is not None else set()
-    repair_state = RepairState()
-    analyzer_verification_state = AnalyzerVerificationState()
+    run_state = run_state if run_state is not None else AgentRunState()
     for attempt in range(MAX_VALIDATION_RETRIES + 1):
         try:
             if simulate_validation_error_once and attempt == 0:
@@ -548,9 +532,7 @@ def analyze_text(
                 client,
                 permission_policy,
                 file_access_policy,
-                changed_file_paths,
-                repair_state,
-                analyzer_verification_state,
+                run_state,
             )
         except ValidationError as error:
             validation_error = error
@@ -658,6 +640,41 @@ def format_changed_files(file_paths: set[str]) -> str:
     return "\n".join(lines)
 
 
+def check_agent_completion(run_state: AgentRunState) -> AgentCompletionCheck:
+    """Return completion failures derived from the final local agent-run state."""
+    failures = []
+    if run_state.verification_dirty:
+        failures.append(
+            "A file was changed but has not been verified. Run the appropriate verification tool."
+        )
+    if run_state.verification_failed:
+        failures.append(
+            "The most recent verification failed. Inspect its output before making a "
+            "grounded repair."
+        )
+    if run_state.repair_attempts >= MAX_REPAIR_ATTEMPTS and (
+        run_state.verification_dirty or run_state.verification_failed
+    ):
+        failures.append(
+            f"The repair limit of {MAX_REPAIR_ATTEMPTS} attempts was reached. Do not make "
+            "another repair; report the unresolved verification failure."
+        )
+
+    return AgentCompletionCheck(passed=not failures, failures=tuple(failures))
+
+
+def completion_rejection_message(completion: AgentCompletionCheck) -> dict[str, str]:
+    """Format a harness-controlled continuation for an incomplete agent run."""
+    return {
+        "role": "system",
+        "content": (
+            "Completion rejected by the harness:\n"
+            + "\n".join(completion.failures)
+            + "\nContinue working on the task."
+        ),
+    }
+
+
 def main() -> None:
     """Analyze a text file supplied from the command line."""
     parser = argparse.ArgumentParser(description="Analyze source files with the available tools.")
@@ -693,7 +710,7 @@ def main() -> None:
         parser.error(f"could not initialize OpenAI client: {error}")
 
     analysis_started_at = time.perf_counter()
-    changed_file_paths = set()
+    run_state = AgentRunState()
     print(format_permission_policy(permission_policy))
 
     try:
@@ -704,7 +721,7 @@ def main() -> None:
             simulate_validation_error_once=args.simulate_validation_error_once,
             permission_policy=permission_policy,
             file_access_policy=file_access_policy,
-            changed_file_paths=changed_file_paths,
+            run_state=run_state,
         )
     except AnalysisError as error:
         parser.error(str(error))
@@ -713,7 +730,8 @@ def main() -> None:
 
     print(format_analysis_result_object(response.output_parsed))
     print(format_analysis_metrics(response, analysis_elapsed_seconds))
-    print(format_changed_files(changed_file_paths))
+    print(format_changed_files(run_state.changed_file_paths))
+    print(f"Completion Check: {json.dumps(asdict(check_agent_completion(run_state)))}")
     # print(format_token_usage(response))
 
 

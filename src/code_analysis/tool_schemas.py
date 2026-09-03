@@ -377,10 +377,10 @@ TOOL_PERMISSIONS: dict[str, frozenset[ToolPermission]] = {
     READ_FILE_TOOL["name"]: frozenset({ToolPermission.READ}),
     LIST_FILES_TOOL["name"]: frozenset({ToolPermission.READ}),
     SEARCH_CODE_TOOL["name"]: frozenset({ToolPermission.READ}),
-    RUN_FLUTTER_TESTS_TOOL["name"]: frozenset({ToolPermission.EXECUTE}),
+    # RUN_FLUTTER_TESTS_TOOL["name"]: frozenset({ToolPermission.EXECUTE}),
     RUN_DART_ANALYZE_TOOL["name"]: frozenset({ToolPermission.EXECUTE}),
-    RUN_DART_FORMAT_TOOL["name"]: frozenset({ToolPermission.WRITE}),
-    APPLY_PATCH_TOOL["name"]: frozenset({ToolPermission.READ, ToolPermission.WRITE}),
+    # RUN_DART_FORMAT_TOOL["name"]: frozenset({ToolPermission.WRITE}),
+    APPLY_PATCH_TOOL["name"]: frozenset({ToolPermission.WRITE}),
 }
 
 
