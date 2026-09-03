@@ -606,7 +606,7 @@ def test_repair_attempts_are_limited_after_a_verification_failure(tmp_path) -> N
     )
     run_state = main.AgentRunState(
         analyzer_baseline_output="baseline",
-        verification_failed=True,
+        analyzer_issues_found=True,
     )
 
     tool_outputs = main.execute_file_tool_calls(
@@ -1630,6 +1630,38 @@ def test_format_analysis_metrics_handles_missing_usage() -> None:
     )
 
 
+def test_build_run_metrics_uses_agent_run_state() -> None:
+    run_state = main.AgentRunState(
+        changed_file_paths={"lib/changed.dart"},
+        repair_attempts=2,
+        read_file_paths={"lib/read.dart", "lib/changed.dart"},
+        model_calls=3,
+        tool_calls=8,
+        searched_file_paths={"lib/read.dart"},
+        patch_attempts=4,
+        input_tokens=120,
+        output_tokens=45,
+    )
+
+    assert main.build_run_metrics(
+        run_state,
+        1.25,
+        main.AgentCompletionCheck(passed=True, failures=()),
+    ) == main.RunMetrics(
+        model_calls=3,
+        tool_calls=8,
+        files_searched=1,
+        files_read=2,
+        files_changed=1,
+        patch_attempts=4,
+        repair_attempts=2,
+        input_tokens=120,
+        output_tokens=45,
+        runtime_seconds=1.25,
+        completion_passed=True,
+    )
+
+
 def test_format_changed_files_reports_sorted_paths_or_no_changes() -> None:
     assert main.format_changed_files({"lib/b.dart", "lib/a.dart"}) == (
         "Changed Files\n  - lib/a.dart\n  - lib/b.dart"
@@ -1682,7 +1714,7 @@ def test_main_prints_model_response(monkeypatch, capsys, tmp_path) -> None:
         "format_analysis_result_object",
         lambda result: "Formatted analysis result",
     )
-    monkeypatch.setattr(main, "format_analysis_metrics", lambda response, elapsed: "Metrics")
+    monkeypatch.setattr(main, "format_run_metrics", lambda metrics: "Metrics")
     timestamps = iter([10.0, 11.5])
     monkeypatch.setattr(main.time, "perf_counter", lambda: next(timestamps))
     monkeypatch.setattr(main, "format_token_usage", lambda response: "Token usage: 10")

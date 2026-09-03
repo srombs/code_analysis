@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from openai import OpenAI
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from code_analysis.schemas import AnalysisResult, Finding  # noqa: F401
 from code_analysis.tool_schemas import (
@@ -106,7 +106,14 @@ class AgentRunState:
     read_file_paths: set[str] = field(default_factory=set)
     analyzer_baseline_output: str | None = None
     analyzer_baseline_issue_count: int | None = None
+    analyzer_issues_found: bool = False
     verification_failed: bool = False
+    model_calls: int = 0
+    tool_calls: int = 0
+    searched_file_paths: set[str] = field(default_factory=set)
+    patch_attempts: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -115,6 +122,22 @@ class AgentCompletionCheck:
 
     passed: bool
     failures: tuple[str, ...]
+
+
+class RunMetrics(BaseModel):
+    """Aggregate measurements from one complete agent run."""
+
+    model_calls: int
+    tool_calls: int
+    files_searched: int
+    files_read: int
+    files_changed: int
+    patch_attempts: int
+    repair_attempts: int
+    input_tokens: int
+    output_tokens: int
+    runtime_seconds: float
+    completion_passed: bool
 
 
 @dataclass(frozen=True)
@@ -253,6 +276,7 @@ def execute_file_tool_calls(
     for output_item in getattr(response, "output", []):
         if getattr(output_item, "type", None) != "function_call":
             continue
+        run_state.tool_calls += 1
 
         try:
             arguments = json.loads(output_item.arguments)
@@ -296,6 +320,7 @@ def execute_file_tool_calls(
                 query = arguments["query"]
                 print(f"Tool call: search_code({query})")
                 search_result = search_code(query, file_access_policy)
+                run_state.searched_file_paths.update(match.path for match in search_result.matches)
                 output = json.dumps(asdict(search_result))
                 print(
                     "Tool result: found "
@@ -322,6 +347,9 @@ def execute_file_tool_calls(
                 run_state.verification_failed = not analyze_result.success
                 analyzer_output = _analyzer_output(analyze_result)
                 issue_count = _analyzer_issue_count(analyzer_output)
+                run_state.analyzer_issues_found = (
+                    issue_count is not None and issue_count > 0
+                ) or bool(analyze_result.issues)
                 baseline_diff = ""
                 new_issues_introduced = False
                 if run_state.verification_dirty:
@@ -355,7 +383,6 @@ def execute_file_tool_calls(
                     print(f"Tool result: dart analyze reported {issue_count} issues")
                 if new_issues_introduced:
                     print("Tool result: new analyzer issues introduced")
-                print(f"Tool output:\n{json.dumps(asdict(analyze_result), indent=2)}")
             elif output_item.name == RUN_DART_FORMAT_TOOL["name"]:
                 if not isinstance(arguments, dict) or arguments:
                     raise ValueError("run_dart_format does not accept arguments")
@@ -377,6 +404,7 @@ def execute_file_tool_calls(
 
                 patch_request = PatchRequest(**arguments)
                 print(f"Tool call: apply_patch({patch_request.path})")
+                run_state.patch_attempts += 1
                 if run_state.analyzer_baseline_output is None:
                     patch_result = PatchResult(
                         success=False,
@@ -384,7 +412,7 @@ def execute_file_tool_calls(
                         replacements=0,
                         message="Run dart analyze before applying a patch to establish a baseline.",
                     )
-                elif run_state.verification_failed:
+                elif run_state.analyzer_issues_found:
                     if run_state.repair_attempts >= MAX_REPAIR_ATTEMPTS:
                         patch_result = PatchResult(
                             success=False,
@@ -447,9 +475,10 @@ def request_analysis_with_tools(
     }
     request_options["input"] = number_source_lines(text) if text else instructions
 
-    response = client.responses.parse(**request_options)
-
     run_state = run_state if run_state is not None else AgentRunState()
+    response = client.responses.parse(**request_options)
+    _record_model_response(response, run_state)
+
     for tool_round in range(MAX_TOOL_CALL_ROUNDS):
         tool_outputs = execute_file_tool_calls(
             response,
@@ -474,6 +503,7 @@ def request_analysis_with_tools(
             tools=tools_allowed_by(permission_policy),
             tool_choice="auto",
         )
+        _record_model_response(response, run_state)
 
     raise AnalysisError(f"Model requested more than {MAX_TOOL_CALL_ROUNDS} rounds of tooling.")
 
@@ -481,6 +511,16 @@ def request_analysis_with_tools(
 def _analyzer_output(analyze_result: DartAnalyzeResult) -> str:
     """Combine analyzer streams into a stable baseline representation."""
     return f"stdout:\n{analyze_result.stdout}\nstderr:\n{analyze_result.stderr}"
+
+
+def _record_model_response(response: object, run_state: AgentRunState) -> None:
+    """Accumulate one completed Responses API call in the run metrics."""
+    run_state.model_calls += 1
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return
+    run_state.input_tokens += getattr(usage, "input_tokens", 0) or 0
+    run_state.output_tokens += getattr(usage, "output_tokens", 0) or 0
 
 
 def _analyzer_output_diff(baseline_output: str, current_output: str) -> str:
@@ -630,6 +670,32 @@ def format_analysis_metrics(response: object, elapsed_seconds: float) -> str:
     return "\n".join(lines)
 
 
+def build_run_metrics(
+    run_state: AgentRunState,
+    runtime_seconds: float,
+    completion: AgentCompletionCheck,
+) -> RunMetrics:
+    """Build the final metrics object from locally tracked harness state."""
+    return RunMetrics(
+        model_calls=run_state.model_calls,
+        tool_calls=run_state.tool_calls,
+        files_searched=len(run_state.searched_file_paths),
+        files_read=len(run_state.read_file_paths),
+        files_changed=len(run_state.changed_file_paths),
+        patch_attempts=run_state.patch_attempts,
+        repair_attempts=run_state.repair_attempts,
+        input_tokens=run_state.input_tokens,
+        output_tokens=run_state.output_tokens,
+        runtime_seconds=runtime_seconds,
+        completion_passed=completion.passed,
+    )
+
+
+def format_run_metrics(metrics: RunMetrics) -> str:
+    """Serialize final run metrics for terminal logging."""
+    return f"Run Metrics: {metrics.model_dump_json()}"
+
+
 def format_changed_files(file_paths: set[str]) -> str:
     """Format the project-relative files changed during one agent run."""
     lines = ["Changed Files"]
@@ -728,10 +794,12 @@ def main() -> None:
 
     analysis_elapsed_seconds = time.perf_counter() - analysis_started_at
 
+    completion = check_agent_completion(run_state)
+    metrics = build_run_metrics(run_state, analysis_elapsed_seconds, completion)
     print(format_analysis_result_object(response.output_parsed))
-    print(format_analysis_metrics(response, analysis_elapsed_seconds))
+    print(format_run_metrics(metrics))
     print(format_changed_files(run_state.changed_file_paths))
-    print(f"Completion Check: {json.dumps(asdict(check_agent_completion(run_state)))}")
+    print(f"Completion Check: {json.dumps(asdict(completion))}")
     # print(format_token_usage(response))
 
 
