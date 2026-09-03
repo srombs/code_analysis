@@ -1,9 +1,7 @@
 """Command-line entry point for code-analysis."""
 
 import argparse
-import difflib
 import json
-import re
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -20,7 +18,6 @@ from code_analysis.tool_schemas import (
     RUN_DART_FORMAT_TOOL,
     RUN_FLUTTER_TESTS_TOOL,
     SEARCH_CODE_TOOL,
-    DartAnalyzeResult,
     FileAccessPolicy,
     FileState,
     PatchRequest,
@@ -34,6 +31,28 @@ from code_analysis.tool_schemas import (
     run_dart_format,
     run_flutter_tests,
     search_code,
+)
+from code_analysis.utils import (
+    analyzer_issue_count as _analyzer_issue_count,
+)
+from code_analysis.utils import (
+    analyzer_output as _analyzer_output,
+)
+from code_analysis.utils import (
+    analyzer_output_diff as _analyzer_output_diff,
+)
+from code_analysis.utils import (
+    format_analysis_metrics,  # noqa: F401
+    format_analysis_result,  # noqa: F401
+    format_analysis_result_object,
+    format_changed_files,
+    format_output_items,  # noqa: F401
+    format_response,  # noqa: F401
+    format_run_metrics,
+    format_token_usage,  # noqa: F401
+    max_output_tokens,  # noqa: F401
+    number_source_lines,
+    temperature,  # noqa: F401
 )
 
 MODEL = "gpt-5.6-luna"
@@ -87,9 +106,6 @@ When a code modification causes static analysis or tests to fail:
 MAX_VALIDATION_RETRIES = 2
 MAX_TOOL_CALL_ROUNDS = 15
 MAX_REPAIR_ATTEMPTS = 3
-MAX_ANALYZER_DIFF_CHARS = 20_000
-INPUT_TOKEN_COST_PER_MILLION = 0.20
-OUTPUT_TOKEN_COST_PER_MILLION = 1.20
 
 
 class AnalysisError(Exception):
@@ -220,29 +236,6 @@ def read_text_file_with_retry(file_path: str) -> str:
         except OSError as error:
             print(f"Could not read {file_path}: {error.strerror or error}")
             file_path = input("Enter a valid file path: ").strip()
-
-
-def temperature(value: str) -> float:
-    """Parse a temperature value accepted by the Responses API."""
-    parsed_value = float(value)
-    if not 0 <= parsed_value <= 2:
-        raise argparse.ArgumentTypeError("temperature must be between 0 and 2")
-    return parsed_value
-
-
-def max_output_tokens(value: str) -> int:
-    """Parse an output-token limit accepted by the selected model."""
-    parsed_value = int(value)
-    if not 1 <= parsed_value <= 128_000:
-        raise argparse.ArgumentTypeError("max output tokens must be between 1 and 128000")
-    return parsed_value
-
-
-def number_source_lines(text: str) -> str:
-    """Add one-based line numbers so the model can reference source locations."""
-    return "\n".join(
-        f"{line_number}: {line}" for line_number, line in enumerate(text.splitlines(), start=1)
-    )
 
 
 def validate_analysis_result_source_lines(
@@ -508,11 +501,6 @@ def request_analysis_with_tools(
     raise AnalysisError(f"Model requested more than {MAX_TOOL_CALL_ROUNDS} rounds of tooling.")
 
 
-def _analyzer_output(analyze_result: DartAnalyzeResult) -> str:
-    """Combine analyzer streams into a stable baseline representation."""
-    return f"stdout:\n{analyze_result.stdout}\nstderr:\n{analyze_result.stderr}"
-
-
 def _record_model_response(response: object, run_state: AgentRunState) -> None:
     """Accumulate one completed Responses API call in the run metrics."""
     run_state.model_calls += 1
@@ -521,31 +509,6 @@ def _record_model_response(response: object, run_state: AgentRunState) -> None:
         return
     run_state.input_tokens += getattr(usage, "input_tokens", 0) or 0
     run_state.output_tokens += getattr(usage, "output_tokens", 0) or 0
-
-
-def _analyzer_output_diff(baseline_output: str, current_output: str) -> str:
-    """Return a bounded unified diff between analyzer runs."""
-    diff = "\n".join(
-        difflib.unified_diff(
-            baseline_output.splitlines(),
-            current_output.splitlines(),
-            fromfile="baseline",
-            tofile="current",
-            lineterm="",
-        )
-    )
-    if len(diff) <= MAX_ANALYZER_DIFF_CHARS:
-        return diff
-    edge_chars = MAX_ANALYZER_DIFF_CHARS // 2
-    return diff[:edge_chars] + diff[-edge_chars:]
-
-
-def _analyzer_issue_count(analyzer_output: str) -> int | None:
-    """Extract Dart analyzer's reported issue count from its output."""
-    if re.search(r"\bno issues found\b", analyzer_output, flags=re.IGNORECASE):
-        return 0
-    match = re.search(r"\b(\d+) issues? found\b", analyzer_output, flags=re.IGNORECASE)
-    return int(match.group(1)) if match else None
 
 
 def analyze_text(
@@ -596,80 +559,6 @@ def analyze_text(
     return response
 
 
-def format_response(response: object) -> str:
-    """Serialize an SDK response as formatted JSON for terminal output."""
-    return json.dumps(response.model_dump(), indent=2)
-
-
-def format_output_items(response: object) -> str:
-    """Serialize the model's typed output items as formatted JSON."""
-    return json.dumps([item.model_dump() for item in response.output], indent=2)
-
-
-def format_analysis_result(response: object) -> str:
-    """Serialize the parsed, application-specific analysis result."""
-    return response.output_parsed.model_dump_json(indent=2)
-
-
-def format_analysis_result_object(result: AnalysisResult) -> str:
-    """Format an AnalysisResult object as a readable terminal report."""
-    lines = ["Analysis Result", f"Summary: {result.summary}", "", "Findings:"]
-
-    if not result.findings:
-        lines.append("  No issues found.")
-
-    for number, finding in enumerate(result.findings, start=1):
-        location = f"lines {finding.start_line}-{finding.end_line}"
-        if finding.start_character is not None and finding.end_character is not None:
-            location += f", characters {finding.start_character}-{finding.end_character}"
-
-        lines.extend(
-            [
-                f"  {number}. [{finding.severity.upper()}] {location}",
-                f"     Problem: {finding.problem}",
-                f"     Solution: {finding.solution}",
-            ]
-        )
-
-    return "\n".join(lines)
-
-
-def format_token_usage(response: object) -> str:
-    """Format the response's input and output token counts."""
-    if response.usage is None:
-        return "Token usage: unavailable"
-
-    return (
-        "Token usage:\n"
-        f"  Input tokens: {response.usage.input_tokens}\n"
-        f"  Output tokens: {response.usage.output_tokens}"
-    )
-
-
-def format_analysis_metrics(response: object, elapsed_seconds: float) -> str:
-    """Format token usage, estimated token cost, and analysis duration."""
-    lines = ["Analysis Metrics"]
-
-    if response.usage is None:
-        lines.append("  Token usage: unavailable")
-        lines.append("  Estimated token cost: unavailable")
-    else:
-        input_cost = response.usage.input_tokens * INPUT_TOKEN_COST_PER_MILLION / 1_000_000
-        output_cost = response.usage.output_tokens * OUTPUT_TOKEN_COST_PER_MILLION / 1_000_000
-        estimated_cost = input_cost + output_cost
-
-        lines.extend(
-            [
-                f"  Input tokens: {response.usage.input_tokens}",
-                f"  Output tokens: {response.usage.output_tokens}",
-                f"  Estimated token cost: ${estimated_cost:.6f}",
-            ]
-        )
-
-    lines.append(f"  Analysis time: {elapsed_seconds:.2f} seconds")
-    return "\n".join(lines)
-
-
 def build_run_metrics(
     run_state: AgentRunState,
     runtime_seconds: float,
@@ -689,21 +578,6 @@ def build_run_metrics(
         runtime_seconds=runtime_seconds,
         completion_passed=completion.passed,
     )
-
-
-def format_run_metrics(metrics: RunMetrics) -> str:
-    """Serialize final run metrics for terminal logging."""
-    return f"Run Metrics: {metrics.model_dump_json()}"
-
-
-def format_changed_files(file_paths: set[str]) -> str:
-    """Format the project-relative files changed during one agent run."""
-    lines = ["Changed Files"]
-    if not file_paths:
-        lines.append("  No files changed.")
-    else:
-        lines.extend(f"  - {path}" for path in sorted(file_paths))
-    return "\n".join(lines)
 
 
 def check_agent_completion(run_state: AgentRunState) -> AgentCompletionCheck:
